@@ -15,6 +15,12 @@ nonisolated struct Repository: Identifiable, Codable, Hashable, Sendable {
         URL(filePath: path, directoryHint: .isDirectory)
     }
 
+    /// A stable path used when comparing repositories. Folder pickers may return
+    /// the same directory through a symlink or with redundant path components.
+    var canonicalPath: String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
     var name: String {
         let component = url.lastPathComponent
         return component.isEmpty ? path : component

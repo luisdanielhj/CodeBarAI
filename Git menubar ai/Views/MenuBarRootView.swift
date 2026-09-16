@@ -13,7 +13,7 @@ struct MenuBarRootView: View {
         VStack(spacing: 0) {
             content
         }
-        .frame(width: 390)
+        .frame(width: 360)
         .task {
             model.start()
             await model.refreshAll()

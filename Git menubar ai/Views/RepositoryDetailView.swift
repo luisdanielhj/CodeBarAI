@@ -42,6 +42,8 @@ struct RepositoryDetailView: View {
                 model.selectedRepositoryID = nil
             }
 
+            RepositoryIconView(data: state.projectIconData, size: 22)
+
             VStack(alignment: .leading, spacing: 1) {
                 Text(state.repository.name)
                     .font(.system(size: 13, weight: .semibold))
@@ -147,11 +149,14 @@ struct RepositoryDetailView: View {
 
     private var footer: some View {
         HStack(spacing: 12) {
-            FooterButton(title: "Finder", systemImage: "folder") {
-                model.openInFinder(state)
+            FooterButton(title: "Cursor", assetImage: "CursorLogo") {
+                Task { await model.openInCursor(state) }
             }
-            FooterButton(title: "Terminal", systemImage: "apple.terminal") {
-                Task { await model.openInTerminal(state) }
+            FooterButton(title: "Claude Code", assetImage: "ClaudeLogo") {
+                Task { await model.openInClaudeCode(state) }
+            }
+            FooterButton(title: "Codex", assetImage: "CodexLogo") {
+                Task { await model.openInCodex(state) }
             }
 
             Spacer()
@@ -168,14 +173,27 @@ struct RepositoryDetailView: View {
 /// Text-and-icon button used in the detail footer.
 struct FooterButton: View {
     let title: String
-    let systemImage: String
+    var systemImage: String?
+    var assetImage: String?
     var tint: Color = .secondary
     let action: () -> Void
     @State private var isHovering = false
 
     var body: some View {
         Button(action: action) {
-            Label(title, systemImage: systemImage)
+            Label {
+                Text(title)
+            } icon: {
+                if let assetImage {
+                    Image(assetImage)
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 11, height: 11)
+                } else if let systemImage {
+                    Image(systemName: systemImage)
+                }
+            }
                 .font(.system(size: 10.5, weight: .medium))
                 .foregroundStyle(isHovering ? tint.opacity(0.9) : tint)
         }
@@ -186,6 +204,7 @@ struct FooterButton: View {
 
 /// The scrollable list of changed files.
 struct ChangedFilesSection: View {
+    @Environment(AppModel.self) private var model
     let state: RepositoryState
 
     var body: some View {
@@ -206,13 +225,15 @@ struct ChangedFilesSection: View {
                         LazyVStack(spacing: 1) {
                             ForEach(status.changes) { change in
                                 ChangedFileRow(
-                                    change: change,
-                                    repositoryURL: state.repository.url
-                                )
+                                    change: change
+                                ) {
+                                    Task { await model.openInCursor(change, in: state) }
+                                }
                             }
                         }
                         .padding(.horizontal, 6)
                         .padding(.bottom, 6)
+                        .syncScrollerAppearance()
                     }
                     .frame(height: rowsHeight(for: status.changes.count))
                 }
@@ -238,13 +259,13 @@ struct ChangedFilesSection: View {
     }
 }
 
-/// A single changed file. Clicking reveals it in Finder.
+/// A single changed file. Clicking opens it in Cursor.
 struct ChangedFileRow: View {
     let change: GitFileChange
-    let repositoryURL: URL
+    let action: () -> Void
 
     var body: some View {
-        HoverRow(action: reveal) {
+        HoverRow(action: action) {
             HStack(spacing: 7) {
                 Image(systemName: change.kind.symbolName)
                     .font(.system(size: 10.5))
@@ -283,9 +304,4 @@ struct ChangedFileRow: View {
         }
     }
 
-    private func reveal() {
-        let fileURL = repositoryURL.appending(path: change.path)
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([fileURL])
-    }
 }

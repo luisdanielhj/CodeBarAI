@@ -32,13 +32,15 @@ struct RepositoryListView: View {
             }
 
             Divider().opacity(0.5)
+            AIUsageView(model: model.usage)
+            Divider().opacity(0.5)
             footer
         }
     }
 
     private var header: some View {
         HStack(spacing: 6) {
-            Text("Repositories")
+            Text("CodeBarAI")
                 .font(.system(size: 13, weight: .semibold))
 
             if model.totalChangedFileCount > 0 {
@@ -61,21 +63,26 @@ struct RepositoryListView: View {
     private var repositoryList: some View {
         ScrollView {
             VStack(spacing: 1) {
-                ForEach(model.repositories) { state in
+                ForEach(model.displayedRepositories) { state in
                     RepositoryRow(state: state) {
                         model.selectedRepositoryID = state.id
                     }
                     .contextMenu {
-                        Button("Open in Finder") { model.openInFinder(state) }
-                        Button("Open in Terminal") { Task { await model.openInTerminal(state) } }
+                        Button("Open in Cursor") { Task { await model.openInCursor(state) } }
+                        Button("Open in Claude Code") { Task { await model.openInClaudeCode(state) } }
+                        Button("Open in Codex") { Task { await model.openInCodex(state) } }
                         Divider()
                         Button("Remove from List") { model.remove(state) }
                     }
                 }
             }
             .padding(6)
+            .syncScrollerAppearance()
         }
-        .frame(maxHeight: 360)
+        // A ScrollView has no useful ideal height inside a MenuBarExtra window,
+        // so AppKit can collapse it to zero even though its rows exist. Reserve
+        // one row of height per repository and start scrolling at eight rows.
+        .frame(height: min(CGFloat(model.repositories.count) * 44 + 12, 400))
     }
 
     private var emptyState: some View {
@@ -106,7 +113,7 @@ struct RepositoryListView: View {
 
     private var footer: some View {
         HStack {
-            Text("Commit Bar")
+            Text("Built by UpskyAI")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
 
@@ -134,6 +141,8 @@ struct RepositoryRow: View {
         HoverRow(action: action) {
             HStack(spacing: 9) {
                 statusIndicator
+
+                RepositoryIconView(data: state.projectIconData, size: 20)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(state.repository.name)

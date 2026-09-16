@@ -141,9 +141,7 @@ struct CommitComposer: View {
             if case .nothingToCommit = blocker { return nil }
             return blocker.message
         }
-        if state.trimmedCommitMessage.isEmpty {
-            return "Enter or generate a message to enable committing."
-        }
+
         return nil
     }
 }
@@ -193,6 +191,7 @@ struct SensitiveFileWarning: View {
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .syncScrollerAppearance()
                 }
                 .frame(maxHeight: 110)
 

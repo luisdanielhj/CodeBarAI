@@ -11,6 +11,9 @@ final class RepositoryState: Identifiable {
     /// Set when reading status failed, e.g. the folder was moved or deleted.
     var loadFailure: GitFailure?
     var isRefreshing = false
+    /// Small project artwork discovered from an `.ico` file in the repository.
+    var projectIconData: Data?
+    var didSearchForProjectIcon = false
 
     // MARK: Commit composer
 

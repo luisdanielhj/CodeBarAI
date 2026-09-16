@@ -24,6 +24,8 @@ final class AppModel {
     /// Sensitive-file confirmation waiting on the user.
     var pendingCommit: PendingCommit?
 
+    let usage = AIUsageModel()
+
     private let git = GitClient.shared
     private let store = RepositoryStore()
     private let generator = CommitMessageGenerator()
@@ -33,6 +35,8 @@ final class AppModel {
 
     init() {
         repositories = store.load().map { RepositoryState(repository: $0) }
+        sortRepositories()
+        usage.startAutoRefresh()
     }
 
     /// Begins watching the stored repositories. Idempotent, so the view can call
@@ -60,6 +64,17 @@ final class AppModel {
     /// Total number of changed files across every repository, for the menu bar icon.
     var totalChangedFileCount: Int {
         repositories.reduce(0) { $0 + ($1.status?.changedFileCount ?? 0) }
+    }
+
+    /// Repositories with uncommitted changes come first; each group remains
+    /// alphabetized. This changes presentation only and does not rewrite storage.
+    var displayedRepositories: [RepositoryState] {
+        repositories.sorted { lhs, rhs in
+            let lhsHasChanges = lhs.status?.isClean == false
+            let rhsHasChanges = rhs.status?.isClean == false
+            if lhsHasChanges != rhsHasChanges { return lhsHasChanges }
+            return lhs.repository.name.localizedStandardCompare(rhs.repository.name) == .orderedAscending
+        }
     }
 
     var generatorEngineDescription: String {
@@ -92,6 +107,7 @@ final class AppModel {
     }
 
     func refresh(_ state: RepositoryState) async {
+        loadProjectIconIfNeeded(for: state)
         state.isRefreshing = true
         defer { state.isRefreshing = false }
 
@@ -137,6 +153,18 @@ final class AppModel {
         store.save(repositories.map(\.repository))
     }
 
+    private func loadProjectIconIfNeeded(for state: RepositoryState) {
+        guard !state.didSearchForProjectIcon else { return }
+        state.didSearchForProjectIcon = true
+        let repositoryURL = state.repository.url
+
+        Task { @MainActor [weak self, weak state] in
+            let data = await ProjectIconLoader.loadIconData(in: repositoryURL)
+            guard let self, let state, repositories.contains(where: { $0 === state }) else { return }
+            state.projectIconData = data
+        }
+    }
+
     // MARK: - Managing repositories
 
     func addRepository() async {
@@ -145,12 +173,18 @@ final class AppModel {
 
         do {
             let root = try await git.repositoryRoot(containing: url)
-            guard !repositories.contains(where: { $0.repository.path == root }) else {
-                addFailure = "“\(url.lastPathComponent)” is already in the list."
+            let repository = Repository(path: root)
+            if let existing = repositories.first(where: {
+                $0.repository.canonicalPath == repository.canonicalPath
+            }) {
+                // Choosing an existing repository is harmless. Reveal it instead
+                // of leaving the user with an error and no obvious way forward.
+                await refresh(existing)
+                selectedRepositoryID = existing.id
                 return
             }
 
-            let state = RepositoryState(repository: Repository(path: root))
+            let state = RepositoryState(repository: repository)
             repositories.append(state)
             sortRepositories()
             persist()
@@ -204,12 +238,7 @@ final class AppModel {
 
         let generated = await generator.generate(for: context)
         state.commitMessage = generated.message
-        switch generated.source {
-        case .foundationModels:
-            state.generationNote = "Written by the on-device model."
-        case .heuristic(let reason):
-            state.generationNote = reason.map { "Local fallback — \($0)" } ?? "Local fallback."
-        }
+
     }
 
     // MARK: - Commit and push
@@ -354,11 +383,74 @@ final class AppModel {
     }
 
     func openInTerminal(_ state: RepositoryState) async {
+        state.operationFailure = nil
         do {
             try await SystemIntegration.openInTerminal(state.repository.url)
         } catch {
             state.operationFailure = GitFailure(
                 command: "Open in Terminal",
+                exitCode: -1,
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    func openInCursor(_ state: RepositoryState) async {
+        await openInCursor(projectURL: state.repository.url, reportingOn: state)
+    }
+
+    func openInCursor(_ change: GitFileChange, in state: RepositoryState) async {
+        let fileURL = state.repository.url.appending(path: change.path)
+        let existingFileURL = FileManager.default.fileExists(atPath: fileURL.path)
+            ? fileURL
+            : nil
+        await openInCursor(
+            projectURL: state.repository.url,
+            fileURL: existingFileURL,
+            reportingOn: state
+        )
+    }
+
+    private func openInCursor(
+        projectURL: URL,
+        fileURL: URL? = nil,
+        reportingOn state: RepositoryState
+    ) async {
+        state.operationFailure = nil
+        do {
+            try await SystemIntegration.openInCursor(
+                projectURL: projectURL,
+                fileURL: fileURL
+            )
+        } catch {
+            state.operationFailure = GitFailure(
+                command: "Open in Cursor",
+                exitCode: -1,
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    func openInClaudeCode(_ state: RepositoryState) async {
+        state.operationFailure = nil
+        do {
+            try await SystemIntegration.openInClaudeCode(state.repository.url)
+        } catch {
+            state.operationFailure = GitFailure(
+                command: "Open in Claude Code",
+                exitCode: -1,
+                message: "\(error.localizedDescription) Install Claude Code and make sure the claude command is available in Terminal."
+            )
+        }
+    }
+
+    func openInCodex(_ state: RepositoryState) async {
+        state.operationFailure = nil
+        do {
+            try await SystemIntegration.openInCodex(state.repository.url)
+        } catch {
+            state.operationFailure = GitFailure(
+                command: "Open in Codex",
                 exitCode: -1,
                 message: error.localizedDescription
             )

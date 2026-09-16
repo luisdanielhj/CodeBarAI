@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXFileReference section */
-		000000000000000000000120 /* Git menubar ai.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Git menubar ai.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000120 /* CodeBarAI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CodeBarAI.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -38,7 +38,7 @@
 		000000000000000000000020 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				000000000000000000000120 /* Git menubar ai.app */,
+				000000000000000000000120 /* CodeBarAI.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -46,9 +46,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		000000000000000100000000 /* Git menubar ai */ = {
+		000000000000000100000000 /* CodeBarAI */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 000000000000000110000000 /* Build configuration list for PBXNativeTarget "Git menubar ai" */;
+			buildConfigurationList = 000000000000000110000000 /* Build configuration list for PBXNativeTarget "CodeBarAI" */;
 			buildPhases = (
 				000000000000000120000000 /* Sources */,
 				000000000000000130000000 /* Frameworks */,
@@ -59,9 +59,9 @@
 			fileSystemSynchronizedGroups = (
 				000000000000000000000010 /* Git menubar ai */,
 			);
-			name = "Git menubar ai";
-			productName = MyApp;
-			productReference = 000000000000000000000120 /* Git menubar ai.app */;
+			name = CodeBarAI;
+			productName = CodeBarAI;
+			productReference = 000000000000000000000120 /* CodeBarAI.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -93,7 +93,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				000000000000000100000000 /* Git menubar ai */,
+				000000000000000100000000 /* CodeBarAI */,
 			);
 		};
 /* End PBXProject section */
@@ -247,9 +247,10 @@
 			};
 			name = Release;
 		};
-		000000000000000111000000 /* Debug configuration for PBXNativeTarget "Git menubar ai" */ = {
+		000000000000000111000000 /* Debug configuration for PBXNativeTarget "CodeBarAI" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 1;
@@ -258,7 +259,9 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = CodeBarAI;
 				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSAppleEventsUsageDescription = "CodeBarAI uses Terminal to start Claude Code in your selected repository.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -272,8 +275,8 @@
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "devplaceholder.$(PROJECT_UNIQUE_VALUE:identifier).$(PRODUCT_NAME:rfc1034identifier)";
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = "devplaceholder.O07P5HNI.Git-menubar-ai";
+				PRODUCT_NAME = CodeBarAI;
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -287,9 +290,10 @@
 			};
 			name = Debug;
 		};
-		000000000000000112000000 /* Release configuration for PBXNativeTarget "Git menubar ai" */ = {
+		000000000000000112000000 /* Release configuration for PBXNativeTarget "CodeBarAI" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 1;
@@ -298,7 +302,9 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = CodeBarAI;
 				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSAppleEventsUsageDescription = "CodeBarAI uses Terminal to start Claude Code in your selected repository.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -312,8 +318,8 @@
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "devplaceholder.$(PROJECT_UNIQUE_VALUE:identifier).$(PRODUCT_NAME:rfc1034identifier)";
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = "devplaceholder.O07P5HNI.Git-menubar-ai";
+				PRODUCT_NAME = CodeBarAI;
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -338,11 +344,11 @@
 			);
 			defaultConfigurationName = Release;
 		};
-		000000000000000110000000 /* Build configuration list for PBXNativeTarget "Git menubar ai" */ = {
+		000000000000000110000000 /* Build configuration list for PBXNativeTarget "CodeBarAI" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				000000000000000111000000 /* Debug configuration for PBXNativeTarget "Git menubar ai" */,
-				000000000000000112000000 /* Release configuration for PBXNativeTarget "Git menubar ai" */,
+				000000000000000111000000 /* Debug configuration for PBXNativeTarget "CodeBarAI" */,
+				000000000000000112000000 /* Release configuration for PBXNativeTarget "CodeBarAI" */,
 			);
 			defaultConfigurationName = Release;
 		};

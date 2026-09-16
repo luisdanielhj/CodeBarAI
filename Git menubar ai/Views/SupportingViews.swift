@@ -1,4 +1,83 @@
+import AppKit
 import SwiftUI
+
+/// Keeps AppKit's native scroller in step with SwiftUI's color scheme.
+/// `MenuBarExtra` windows can otherwise leave the scroller using the appearance
+/// from the previously active system theme.
+private struct ScrollViewAppearanceSync: NSViewRepresentable {
+    let colorScheme: ColorScheme
+
+    func makeNSView(context: Context) -> AppearanceSyncView {
+        let view = AppearanceSyncView()
+        view.colorScheme = colorScheme
+        return view
+    }
+
+    func updateNSView(_ nsView: AppearanceSyncView, context: Context) {
+        nsView.colorScheme = colorScheme
+        nsView.syncAppearance()
+    }
+}
+
+private final class AppearanceSyncView: NSView {
+    var colorScheme: ColorScheme = .light
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        syncAppearance()
+    }
+
+    func syncAppearance() {
+        let colorScheme = colorScheme
+
+        // SwiftUI may update the representable just before AppKit attaches it
+        // to the scroll view, so perform the lookup on the next main-loop pass.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let scrollView = self.enclosingScrollView else { return }
+            let name: NSAppearance.Name = colorScheme == .dark ? .darkAqua : .aqua
+            let appearance = NSAppearance(named: name)
+
+            scrollView.appearance = appearance
+            scrollView.verticalScroller?.appearance = appearance
+            scrollView.horizontalScroller?.appearance = appearance
+        }
+    }
+}
+
+private struct SyncScrollerAppearanceModifier: ViewModifier {
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
+        content.background {
+            ScrollViewAppearanceSync(colorScheme: colorScheme)
+        }
+    }
+}
+
+extension View {
+    /// Apply to the content inside a SwiftUI `ScrollView`.
+    func syncScrollerAppearance() -> some View {
+        modifier(SyncScrollerAppearanceModifier())
+    }
+}
+
+/// Compact artwork loaded from a repository's `.ico` file.
+struct RepositoryIconView: View {
+    let data: Data?
+    var size: CGFloat = 18
+
+    @ViewBuilder
+    var body: some View {
+        if let data, let image = NSImage(data: data) {
+            Image(nsImage: image)
+                .resizable()
+                .interpolation(.high)
+                .scaledToFit()
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+        }
+    }
+}
 
 /// A borderless row that highlights on hover, the way list rows behave in
 /// Spotlight-style panels.
