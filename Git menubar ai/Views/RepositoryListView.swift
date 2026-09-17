@@ -71,6 +71,12 @@ struct RepositoryListView: View {
                         Button("Open in Cursor") { Task { await model.openInCursor(state) } }
                         Button("Open in Claude Code") { Task { await model.openInClaudeCode(state) } }
                         Button("Open in Codex") { Task { await model.openInCodex(state) } }
+                        if let server = state.devServer {
+                            Divider()
+                            Button("Start Server (\(server.title))") {
+                                Task { await model.startDevServer(state) }
+                            }
+                        }
                         Divider()
                         Button("Remove from List") { model.remove(state) }
                     }

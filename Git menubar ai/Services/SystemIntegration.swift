@@ -84,9 +84,27 @@ enum SystemIntegration {
     }
 
     /// Opens a new Terminal window in the repository and starts Claude Code's
-    /// interactive session there. Using Terminal's login shell lets `claude`
-    /// resolve from the same PATH the user has when opening Terminal normally.
+    /// interactive session there.
     static func openInClaudeCode(_ url: URL) async throws {
+        let output = try await runInTerminal("claude", at: url)
+        guard output.isSuccess else {
+            throw SystemIntegrationError.claudeCodeLaunchFailed(output.diagnostics)
+        }
+    }
+
+    /// Opens a new Terminal window in the repository and starts its development
+    /// server, installing dependencies first when they are missing.
+    static func startDevServer(_ server: DevServer, at url: URL) async throws {
+        let output = try await runInTerminal(server.shellCommand, at: url)
+        guard output.isSuccess else {
+            throw SystemIntegrationError.devServerLaunchFailed(output.diagnostics)
+        }
+    }
+
+    /// Types `command` into a new Terminal window after changing into `url`.
+    /// Using Terminal's login shell lets tools like `claude`, `node` and `pnpm`
+    /// resolve from the same PATH the user has when opening Terminal normally.
+    private static func runInTerminal(_ command: String, at url: URL) async throws -> ProcessOutput {
         guard NSWorkspace.shared.urlForApplication(
             withBundleIdentifier: "com.apple.Terminal"
         ) != nil else {
@@ -96,21 +114,18 @@ enum SystemIntegration {
         let script = """
         on run argv
             set repositoryPath to item 1 of argv
+            set command to item 2 of argv
             tell application "Terminal"
                 activate
-                do script "cd " & quoted form of repositoryPath & " && claude"
+                do script "cd " & quoted form of repositoryPath & " && " & command
             end tell
         end run
         """
-        let output = try await ProcessRunner.run(
+        return try await ProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/osascript"),
-            arguments: ["-e", script, url.path],
+            arguments: ["-e", script, url.path, command],
             timeout: 10
         )
-
-        guard output.isSuccess else {
-            throw SystemIntegrationError.claudeCodeLaunchFailed(output.diagnostics)
-        }
     }
 
     /// Opens the repository as a workspace in the native Codex desktop app.
@@ -143,6 +158,7 @@ enum SystemIntegrationError: LocalizedError {
     case cursorLaunchFailed(String)
     case terminalNotFound
     case claudeCodeLaunchFailed(String)
+    case devServerLaunchFailed(String)
     case codexNotFound
     case codexLaunchFailed(String)
 
@@ -160,6 +176,10 @@ enum SystemIntegrationError: LocalizedError {
             return reason.isEmpty
                 ? "Claude Code could not be started in Terminal."
                 : "Claude Code could not be started in Terminal: \(reason)"
+        case .devServerLaunchFailed(let reason):
+            return reason.isEmpty
+                ? "The server could not be started in Terminal."
+                : "The server could not be started in Terminal: \(reason)"
         case .codexNotFound:
             return "Codex could not be found on this Mac. Install the Codex desktop app and try again."
         case .codexLaunchFailed(let reason):

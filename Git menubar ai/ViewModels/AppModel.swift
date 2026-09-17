@@ -108,6 +108,7 @@ final class AppModel {
 
     func refresh(_ state: RepositoryState) async {
         loadProjectIconIfNeeded(for: state)
+        state.devServer = await DevServer.detect(in: state.repository.url)
         state.isRefreshing = true
         defer { state.isRefreshing = false }
 
@@ -440,6 +441,26 @@ final class AppModel {
                 command: "Open in Claude Code",
                 exitCode: -1,
                 message: "\(error.localizedDescription) Install Claude Code and make sure the claude command is available in Terminal."
+            )
+        }
+    }
+
+    func startDevServer(_ state: RepositoryState) async {
+        state.operationFailure = nil
+        // Detect again so a lockfile or script changed since the last refresh
+        // is honored.
+        guard let server = await DevServer.detect(in: state.repository.url) else {
+            state.devServer = nil
+            return
+        }
+        state.devServer = server
+        do {
+            try await SystemIntegration.startDevServer(server, at: state.repository.url)
+        } catch {
+            state.operationFailure = GitFailure(
+                command: "Start Server",
+                exitCode: -1,
+                message: "\(error.localizedDescription) Make sure \(server.packageManager.rawValue) is available in Terminal."
             )
         }
     }

@@ -14,6 +14,8 @@ final class RepositoryState: Identifiable {
     /// Small project artwork discovered from an `.ico` file in the repository.
     var projectIconData: Data?
     var didSearchForProjectIcon = false
+    /// How to start this repository's Node server, or `nil` when it has none.
+    var devServer: DevServer?
 
     // MARK: Commit composer
 
