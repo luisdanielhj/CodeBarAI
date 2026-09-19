@@ -25,6 +25,17 @@ struct RepositoryListView: View {
                     .padding(.top, 10)
             }
 
+            if let actionFailure = model.actionFailure {
+                InlineBanner(
+                    kind: .error,
+                    title: actionFailure.title,
+                    detail: actionFailure.message,
+                    hint: actionFailure.hint
+                )
+                .padding(.horizontal, 10)
+                .padding(.top, 10)
+            }
+
             if model.repositories.isEmpty {
                 emptyState
             } else {
@@ -77,6 +88,9 @@ struct RepositoryListView: View {
                                 Task { await model.startDevServer(state) }
                             }
                         }
+                        Divider()
+                        Button("Open in Finder") { model.openInFinder(state) }
+                        Button("Open in Terminal") { Task { await model.openInTerminal(state) } }
                         Divider()
                         Button("Remove from List") { model.remove(state) }
                     }

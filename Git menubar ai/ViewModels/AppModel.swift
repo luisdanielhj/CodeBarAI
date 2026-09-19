@@ -19,6 +19,10 @@ final class AppModel {
 
     /// Problem adding a repository, shown on the list screen.
     var addFailure: String?
+    /// Last failed hand-off to Finder, Terminal or an editor. The detail screen
+    /// has its own banner, so this exists for the list, where a context menu
+    /// action would otherwise fail silently.
+    var actionFailure: GitFailure?
     /// Set when the system git itself cannot run at all.
     var gitFailure: String?
     /// Sensitive-file confirmation waiting on the user.
@@ -85,6 +89,7 @@ final class AppModel {
 
     /// Called when the menu bar window opens.
     func refreshAll() async {
+        actionFailure = nil
         await verifyGitIsAvailable()
         await withTaskGroup(of: Void.self) { group in
             for state in repositories {
@@ -377,22 +382,15 @@ final class AppModel {
         await refresh(state)
     }
 
-    // MARK: - Reveal
+    // MARK: - Opening the repository elsewhere
 
     func openInFinder(_ state: RepositoryState) {
         SystemIntegration.openInFinder(state.repository.url)
     }
 
     func openInTerminal(_ state: RepositoryState) async {
-        state.operationFailure = nil
-        do {
+        await handOff(state, named: "Open in Terminal") {
             try await SystemIntegration.openInTerminal(state.repository.url)
-        } catch {
-            state.operationFailure = GitFailure(
-                command: "Open in Terminal",
-                exitCode: -1,
-                message: error.localizedDescription
-            )
         }
     }
 
@@ -417,36 +415,49 @@ final class AppModel {
         fileURL: URL? = nil,
         reportingOn state: RepositoryState
     ) async {
-        state.operationFailure = nil
-        do {
+        await handOff(state, named: "Open in Cursor") {
             try await SystemIntegration.openInCursor(
                 projectURL: projectURL,
                 fileURL: fileURL
-            )
-        } catch {
-            state.operationFailure = GitFailure(
-                command: "Open in Cursor",
-                exitCode: -1,
-                message: error.localizedDescription
             )
         }
     }
 
     func openInClaudeCode(_ state: RepositoryState) async {
-        state.operationFailure = nil
-        do {
+        await handOff(state, named: "Open in Claude Code") {
             try await SystemIntegration.openInClaudeCode(state.repository.url)
+        }
+    }
+
+    func openInCodex(_ state: RepositoryState) async {
+        await handOff(state, named: "Open in Codex") {
+            try await SystemIntegration.openInCodex(state.repository.url)
+        }
+    }
+
+    /// Runs one hand-off to another app, recording why it failed on both the
+    /// repository and the list screen.
+    private func handOff(
+        _ state: RepositoryState,
+        named command: String,
+        _ work: () async throws -> Void
+    ) async {
+        state.operationFailure = nil
+        actionFailure = nil
+        do {
+            try await work()
         } catch {
-            state.operationFailure = GitFailure(
-                command: "Open in Claude Code",
+            let failure = GitFailure(
+                command: command,
                 exitCode: -1,
-                message: "\(error.localizedDescription) Install Claude Code and make sure the claude command is available in Terminal."
+                message: error.localizedDescription
             )
+            state.operationFailure = failure
+            actionFailure = failure
         }
     }
 
     func startDevServer(_ state: RepositoryState) async {
-        state.operationFailure = nil
         // Detect again so a lockfile or script changed since the last refresh
         // is honored.
         guard let server = await DevServer.detect(in: state.repository.url) else {
@@ -454,27 +465,8 @@ final class AppModel {
             return
         }
         state.devServer = server
-        do {
+        await handOff(state, named: "Start Server") {
             try await SystemIntegration.startDevServer(server, at: state.repository.url)
-        } catch {
-            state.operationFailure = GitFailure(
-                command: "Start Server",
-                exitCode: -1,
-                message: "\(error.localizedDescription) Make sure \(server.packageManager.rawValue) is available in Terminal."
-            )
-        }
-    }
-
-    func openInCodex(_ state: RepositoryState) async {
-        state.operationFailure = nil
-        do {
-            try await SystemIntegration.openInCodex(state.repository.url)
-        } catch {
-            state.operationFailure = GitFailure(
-                command: "Open in Codex",
-                exitCode: -1,
-                message: error.localizedDescription
-            )
         }
     }
 }

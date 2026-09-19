@@ -3,20 +3,27 @@ import SwiftUI
 struct AIUsageView: View {
     let model: AIUsageModel
 
+    /// Measured so the section is exactly as tall as the cards it holds; the
+    /// height only ever reaches the cap when every provider is connected.
+    @State private var contentHeight: CGFloat = 126
+
+    private let maximumHeight: CGFloat = 260
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ScrollView {
-                VStack(spacing: 8) {
-                    ForEach(model.states) { state in
-                        AIUsageProviderView(model: model, state: state)
-                    }
+        ScrollView {
+            VStack(spacing: 8) {
+                ForEach(model.states) { state in
+                    AIUsageProviderView(model: model, state: state)
                 }
-                .syncScrollerAppearance()
             }
-            .frame(height: model.states.contains(where: \.isEnabled) ? 260 : 126)
+            // Matches the repository list's insets, so both sections line their
+            // rows up against the same edges.
+            .padding(6)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+            .syncScrollerAppearance()
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .frame(height: min(contentHeight, maximumHeight))
+        .padding(.vertical, 4)
     }
 }
 
@@ -94,7 +101,8 @@ private struct AIUsageProviderView: View {
                 }
             }
         }
-        .padding(8)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
         .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
         .alert("Connect \(state.provider.title)?", isPresented: $confirmingConnection) {
             Button("Cancel", role: .cancel) { }

@@ -131,5 +131,4 @@ Issues and pull requests are welcome. Before opening a PR:
 
 ## License
 
-<!-- TODO: add a LICENSE file (e.g. MIT) and update this section. -->
-No license has been chosen yet. Until a `LICENSE` file is added, all rights are reserved.
+Released under the [MIT License](LICENSE). Copyright (c) 2026 Daniel Juarez.
