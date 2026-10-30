@@ -3,27 +3,111 @@ import SwiftUI
 struct AIUsageView: View {
     let model: AIUsageModel
 
-    /// Measured so the section is exactly as tall as the cards it holds; the
-    /// height only ever reaches the cap when every provider is connected.
+    /// Measure both the usage cards and the organizer to avoid empty space,
+    /// with a height cap for long account lists.
     @State private var contentHeight: CGFloat = 126
+    @State private var organizingMenuBar = false
 
     private let maximumHeight: CGFloat = 260
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 8) {
-                ForEach(model.states) { state in
-                    AIUsageProviderView(model: model, state: state)
+        VStack(spacing: 0) {
+            HStack {
+                Text(organizingMenuBar ? "Menu Bar Accounts" : "AI Usage")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button(organizingMenuBar ? "Done" : "Organize Menu Bar…") {
+                    organizingMenuBar.toggle()
                 }
+                .buttonStyle(.plain)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(Color.accentColor)
             }
-            // Matches the repository list's insets, so both sections line their
-            // rows up against the same edges.
-            .padding(6)
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
-            .syncScrollerAppearance()
+            .padding(.horizontal, 16)
+            .padding(.vertical, 5)
+
+            ScrollView {
+                VStack(spacing: 8) {
+                    if organizingMenuBar {
+                        MenuBarAccountsOrganizer(model: model)
+                    } else {
+                        ForEach(model.states) { state in
+                            AIUsageProviderView(model: model, state: state)
+                        }
+                        Button {
+                            guard let directory = SystemIntegration.chooseClaudeAccountFolder() else { return }
+                            let state = model.addClaudeAccount(directory: directory)
+                            Task { await model.connect(state) }
+                        } label: {
+                            Label("Add Claude Account…", systemImage: "person.badge.plus")
+                                .font(.system(size: 10, weight: .medium))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.accentColor)
+                    }
+                }
+                // Matches the repository list's insets, so both sections line
+                // their rows up against the same edges.
+                .padding(6)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+                .syncScrollerAppearance()
+            }
+            .frame(height: min(contentHeight, maximumHeight))
         }
-        .frame(height: min(contentHeight, maximumHeight))
         .padding(.vertical, 4)
+    }
+}
+
+private struct MenuBarAccountsOrganizer: View {
+    let model: AIUsageModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Check the accounts to show. Use the arrows to set their order from left to right.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            ForEach(model.menuBarAccountStates) { state in
+                HStack(spacing: 6) {
+                    Toggle(state.title, isOn: Binding(
+                        get: { model.isShownInMenuBar(state) },
+                        set: { model.setMenuBarVisibility(state, isVisible: $0) }
+                    ))
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 11))
+                    .lineLimit(1)
+                    .help(state.title)
+                    Spacer(minLength: 0)
+                    Button {
+                        model.moveMenuBarAccount(state, by: -1)
+                    } label: {
+                        Image(systemName: "arrow.up")
+                            .frame(width: 20, height: 20)
+                    }
+                    .disabled(model.menuBarAccountStates.first?.id == state.id)
+                    .help("Move \(state.title) earlier")
+                    .accessibilityLabel("Move \(state.title) earlier")
+                    Button {
+                        model.moveMenuBarAccount(state, by: 1)
+                    } label: {
+                        Image(systemName: "arrow.down")
+                            .frame(width: 20, height: 20)
+                    }
+                    .disabled(model.menuBarAccountStates.last?.id == state.id)
+                    .help("Move \(state.title) later")
+                    .accessibilityLabel("Move \(state.title) later")
+                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 10))
+            }
+        }
+        .padding(10)
+        .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
     }
 }
 
@@ -31,6 +115,8 @@ private struct AIUsageProviderView: View {
     let model: AIUsageModel
     let state: AIUsageState
     @State private var confirmingConnection = false
+    @State private var renamingAccount = false
+    @State private var accountName = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -41,8 +127,16 @@ private struct AIUsageProviderView: View {
                     .scaledToFit()
                     .frame(width: 13, height: 13)
                     .foregroundStyle(.secondary)
-                Text(state.provider.title)
+                Text(state.title)
                     .font(.system(size: 11, weight: .semibold))
+                    .lineLimit(1)
+                    .help(state.claudeProfile?.configDirectory.path ?? state.provider.title)
+                if model.isShownInMenuBar(state) {
+                    Image(systemName: "menubar.rectangle")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                        .help("Shown in the menu bar")
+                }
                 if let plan = state.snapshot?.plan {
                     Text(plan.capitalized)
                         .font(.system(size: 9))
@@ -59,20 +153,37 @@ private struct AIUsageProviderView: View {
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(Color.accentColor)
                 }
-                if state.isEnabled {
-                    Menu {
+                Menu {
+                    Toggle("Show in Menu Bar", isOn: Binding(
+                        get: { model.isShownInMenuBar(state) },
+                        set: { model.setMenuBarVisibility(state, isVisible: $0) }
+                    ))
+                    if state.isEnabled {
+                        Divider()
                         Button("Refresh Usage") { Task { await model.refresh(state) } }
                             .disabled(state.isRefreshing || Date() < state.nextRefreshAt)
                         Button("Disconnect", role: .destructive) { model.disconnect(state) }
-                    } label: {
-                        Image(systemName: "ellipsis")
-                            .font(.system(size: 11))
                     }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
-                    .fixedSize()
-                    .help("Usage options")
+                    if let profile = state.claudeProfile {
+                        Divider()
+                        Button("Rename Account…") {
+                            accountName = profile.name
+                            renamingAccount = true
+                        }
+                        if !profile.isDefault {
+                            Button("Remove from CodeBarAI", role: .destructive) {
+                                model.removeClaudeAccount(state)
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 11))
                 }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Usage options")
             }
 
             if state.isEnabled {
@@ -109,6 +220,14 @@ private struct AIUsageProviderView: View {
             Button("Connect") { Task { await model.connect(state) } }
         } message: {
             Text("CodeBarAI will read this tool’s local sign-in credentials and send them only to its own usage service. Tokens are not saved by CodeBarAI. \(state.provider.connectionHint)")
+        }
+        .alert("Rename Claude Account", isPresented: $renamingAccount) {
+            TextField("Account name", text: $accountName)
+            Button("Cancel", role: .cancel) { }
+            Button("Save") { model.renameClaudeAccount(state, to: accountName) }
+                .disabled(accountName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        } message: {
+            Text("Choose a name such as Personal or Work.")
         }
     }
 }

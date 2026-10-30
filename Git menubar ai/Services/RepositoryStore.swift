@@ -20,7 +20,7 @@ struct RepositoryStore {
         for repository in candidates {
             let canonicalPath = repository.canonicalPath
             guard seenPaths.insert(canonicalPath).inserted else { continue }
-            merged.append(Repository(id: repository.id, path: canonicalPath))
+            merged.append(Repository(id: repository.id, path: canonicalPath, lastWorkedAt: repository.lastWorkedAt))
         }
 
         // The target originally shipped as "MyApp". Xcode included the product

@@ -20,27 +20,32 @@ struct CodeBarAIApp: App {
 }
 
 /// The status item itself. Installed AI providers show the percentage left in
-/// their session and weekly limits; until one is installed, the repository
-/// status remains the fallback.
+/// their session and weekly limits in the user's chosen order. The repository
+/// status is the fallback when no installed account is selected for display.
 struct MenuBarLabel: View {
     let usage: AIUsageModel
     let changedFileCount: Int
 
     private var usageStates: [AIUsageState] {
-        let order: [AIUsageProvider: Int] = [.claude: 0, .codex: 1, .cursor: 2]
-        return usage.states
+        usage.menuBarStates
             .filter { $0.isInstalled || $0.isEnabled }
-            .sorted { order[$0.provider, default: .max] < order[$1.provider, default: .max] }
     }
 
     var body: some View {
         // Read the observable state here, in the label's own body, so changes
         // re-render the status item image.
-        let summaries = usageStates.map(ProviderLimitSummary.init)
+        let claudeAccounts = usage.claudeAccounts
+        let accountNumbers = Dictionary(uniqueKeysWithValues: claudeAccounts.enumerated().map {
+            ($0.element.id, $0.offset + 1)
+        })
+        let summaries = usageStates.map {
+            ProviderLimitSummary(state: $0, accountNumber: claudeAccounts.count > 1 ? accountNumbers[$0.id] : nil)
+        }
         if !summaries.isEmpty, let image = Self.render(summaries) {
             Image(nsImage: image)
                 .renderingMode(.template)
                 .accessibilityLabel(summaries.map(\.accessibilityDescription).joined(separator: "; "))
+                .help(summaries.map(\.accessibilityDescription).joined(separator: "\n"))
         } else {
             repositoryLabel
         }
@@ -93,12 +98,13 @@ private struct ProviderLimitSummary: Identifiable {
     let id: String
     let title: String
     let logoName: String
+    let accountNumber: Int?
     /// The session limit, or Auto for Cursor.
     let top: Limit
     /// The weekly limit, or API for Cursor.
     let bottom: Limit
 
-    init(state: AIUsageState) {
+    init(state: AIUsageState, accountNumber: Int?) {
         let windows = state.snapshot?.windows ?? []
         let top: (id: String, title: String)
         let bottom: (id: String, title: String)
@@ -116,8 +122,9 @@ private struct ProviderLimitSummary: Identifiable {
         }
 
         id = state.id
-        title = state.provider.title
+        title = state.title
         logoName = state.provider.logoName
+        self.accountNumber = accountNumber
         self.top = Self.limit(windows.first { $0.id == top.id }, fallbackTitle: top.title)
         self.bottom = Self.limit(windows.first { $0.id == bottom.id }, fallbackTitle: bottom.title)
     }
@@ -134,7 +141,8 @@ private struct ProviderLimitSummary: Identifiable {
             guard let left = limit.percentLeft else { return "\(limit.title) usage unavailable" }
             return "\(limit.title) \(left) percent left"
         }
-        return ([title] + limits).joined(separator: ", ")
+        let accountTitle = accountNumber.map { "\(title), account \($0)" } ?? title
+        return ([accountTitle] + limits).joined(separator: ", ")
     }
 }
 
@@ -146,11 +154,7 @@ private struct UsageStatusStrip: View {
         HStack(spacing: 10) {
             ForEach(summaries) { summary in
                 HStack(spacing: 4) {
-                    Image(summary.logoName)
-                        .renderingMode(.template)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(width: 14, height: 14)
+                    MenuBarProviderLogo(logoName: summary.logoName, accountNumber: summary.accountNumber)
 
                     VStack(alignment: .trailing, spacing: 0) {
                         percentage(summary.top)

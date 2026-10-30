@@ -23,6 +23,21 @@ enum SystemIntegration {
         return panel.url
     }
 
+    static func chooseClaudeAccountFolder() -> URL? {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.showsHiddenFiles = true
+        panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser
+        panel.message = "Choose this account’s Claude config folder (for example, ~/.claude-work). CodeBarAI will read its sign-in credentials to show usage."
+        panel.prompt = "Add Account"
+        NSApplication.shared.activate()
+        guard panel.runModal() == .OK else { return nil }
+        return panel.url
+    }
+
     static func openInFinder(_ url: URL) {
         NSWorkspace.shared.open(url)
     }
@@ -97,17 +112,31 @@ enum SystemIntegration {
 
     /// Opens a new terminal window in the repository and starts Claude Code's
     /// interactive session there.
-    static func openInClaudeCode(_ url: URL) async throws {
+    static func openInClaudeCode(_ url: URL, profile: ClaudeAccountProfile? = nil) async throws {
         let directories = try await resolve(
             tool: "claude",
             hint: "Install Claude Code, then try again."
         )
         try await runInTerminal(
-            "claude",
+            profile.map { claudeCommand(for: $0) } ?? "claude",
             at: url,
-            windowTitle: "Claude Code — \(url.lastPathComponent)",
+            windowTitle: profile.map { "Claude · \($0.name) — \(url.lastPathComponent)" }
+                ?? "Claude Code — \(url.lastPathComponent)",
             pathAdditions: directories
         )
+    }
+
+    /// Assign inside the interactive command, after shell startup files run,
+    /// so an alias or .zshrc cannot silently choose another account. The empty
+    /// secure-storage override preserves the default account's unscoped entry.
+    nonisolated static func claudeCommand(for profile: ClaudeAccountProfile) -> String {
+        let config = profile.usesDefaultConfigDirectory
+            ? "unset CLAUDE_CONFIG_DIR"
+            : "export CLAUDE_CONFIG_DIR=\(quoted(profile.configDirectory.path))"
+        let inheritedCredentials = "unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN "
+            + "CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY"
+        return config + "; export CLAUDE_SECURESTORAGE_CONFIG_DIR=\(quoted(profile.keychainDirectory ?? "")); "
+            + inheritedCredentials + "; command 'claude'"
     }
 
     /// Opens a new terminal window in the repository and starts its development

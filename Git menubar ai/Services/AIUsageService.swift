@@ -141,11 +141,20 @@ nonisolated enum AIUsageError: Error, LocalizedError, Sendable {
     }
 }
 
-actor AIUsageService {
-    func load(_ provider: AIUsageProvider) async throws -> AIUsageSnapshot {
+nonisolated protocol AIUsageLoading: Sendable {
+    func load(_ provider: AIUsageProvider, claudeProfile: ClaudeAccountProfile?) async throws -> AIUsageSnapshot
+}
+
+actor AIUsageService: AIUsageLoading {
+    /// Each account owns a separate cache entry. A rejection must never evict
+    /// another account's token or make a refresh fall back to that account.
+    private var claudeCache: [String: (token: String, expiresAt: Date?)] = [:]
+
+    func load(_ provider: AIUsageProvider, claudeProfile: ClaudeAccountProfile? = nil) async throws -> AIUsageSnapshot {
+        let profile = claudeProfile ?? .current()
         do {
             try Task.checkCancellation()
-            let request = try makeRequest(for: provider)
+            let request = try await makeRequest(for: provider, claudeProfile: profile)
             try Task.checkCancellation()
             let configuration = URLSessionConfiguration.ephemeral
             configuration.httpCookieStorage = nil
@@ -173,6 +182,7 @@ actor AIUsageService {
             case 300..<400:
                 throw AIUsageError.redirectRejected
             case 401, 403:
+                if provider == .claude { claudeCache.removeValue(forKey: cacheKey(for: profile)) }
                 throw AIUsageError.signInRequired(provider)
             case 429:
                 throw AIUsageError.rateLimited(Self.retryDate(response, now: Date()))
@@ -238,7 +248,7 @@ actor AIUsageService {
         }
     }
 
-    private func makeRequest(for provider: AIUsageProvider) throws -> URLRequest {
+    private func makeRequest(for provider: AIUsageProvider, claudeProfile: ClaudeAccountProfile) async throws -> URLRequest {
         let endpoint: String
         switch provider {
         case .claude: endpoint = "https://api.anthropic.com/api/oauth/usage"
@@ -252,7 +262,7 @@ actor AIUsageService {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         switch provider {
         case .claude:
-            request.setValue("Bearer \(try claudeToken())", forHTTPHeaderField: "Authorization")
+            request.setValue("Bearer \(try await claudeToken(for: claudeProfile))", forHTTPHeaderField: "Authorization")
             request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
             request.setValue("claude-code/2.1.0", forHTTPHeaderField: "User-Agent")
         case .codex:
@@ -267,28 +277,59 @@ actor AIUsageService {
         return request
     }
 
-    private func claudeToken() throws -> String {
-        let environment = ProcessInfo.processInfo.environment
-        let custom = environment["CLAUDE_CONFIG_DIR"].flatMap { $0.isEmpty ? nil : $0 }
-        let home = directory(custom, defaultName: ".claude")
+    private func cacheKey(for profile: ClaudeAccountProfile) -> String {
+        "\(profile.id)|\(profile.keychainService)"
+    }
+
+    private func claudeToken(for profile: ClaudeAccountProfile) async throws -> String {
+        let key = cacheKey(for: profile)
+        if let cached = claudeCache[key], cached.expiresAt.map({ $0 > Date().addingTimeInterval(60) }) ?? true {
+            return cached.token
+        }
+        let credentials = try await Self.readClaudeCredentials(for: profile)
+        claudeCache[key] = credentials
+        return credentials.token
+    }
+
+    nonisolated static func readClaudeCredentials(
+        for profile: ClaudeAccountProfile,
+        keychainReader: @Sendable (String) async throws -> Data? = { try await claudeKeychainItem(service: $0) }
+    ) async throws -> (token: String, expiresAt: Date?) {
         var fileError: AIUsageError = .signInRequired(.claude)
         do {
-            let data = try credentialFile(home.appendingPathComponent(".credentials.json"), provider: .claude)
+            let data = try credentialFile(profile.configDirectory.appendingPathComponent(".credentials.json"), provider: .claude)
             return try Self.validateClaude(data)
         } catch let error as AIUsageError {
             fileError = error
         } catch {
             fileError = .credentialAccessDenied(.claude)
         }
-        guard custom == nil else { throw fileError }
-        do {
-            if let data = try keychain(service: "Claude Code-credentials", account: nil, provider: .claude) {
-                return try Self.validateClaude(data)
-            }
-        } catch let error as AIUsageError {
-            throw error
+        if let data = try await keychainReader(profile.keychainService) {
+            return try Self.validateClaude(data)
         }
         throw fileError
+    }
+
+    /// Claude Code writes its keychain item with `/usr/bin/security`, and every
+    /// rewrite (on each token refresh) resets the item's access list to trust
+    /// only that tool. Reading through it therefore never shows a keychain
+    /// prompt, whereas `SecItemCopyMatching` from this app would prompt again
+    /// after every refresh or rebuild.
+    nonisolated private static func claudeKeychainItem(service: String) async throws -> Data? {
+        let output: ProcessOutput
+        do {
+            output = try await ProcessRunner.run(
+                executableURL: URL(fileURLWithPath: "/usr/bin/security"),
+                arguments: ["find-generic-password", "-s", service, "-w"],
+                timeout: 10
+            )
+        } catch {
+            throw AIUsageError.credentialAccessDenied(.claude)
+        }
+        // 44 is errSecItemNotFound's exit status.
+        if output.exitCode == 44 { return nil }
+        guard output.isSuccess else { throw AIUsageError.credentialAccessDenied(.claude) }
+        return Data(output.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines).utf8)
     }
 
     private func codexCredentials() throws -> (token: String, account: String?) {
@@ -296,7 +337,7 @@ actor AIUsageService {
         let home = directory(custom, defaultName: ".codex").resolvingSymlinksInPath().standardizedFileURL
         var fileError: AIUsageError = .signInRequired(.codex)
         do {
-            let data = try credentialFile(home.appendingPathComponent("auth.json"), provider: .codex)
+            let data = try Self.credentialFile(home.appendingPathComponent("auth.json"), provider: .codex)
             return try Self.validateCodex(data)
         } catch let error as AIUsageError {
             fileError = error
@@ -319,7 +360,7 @@ actor AIUsageService {
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(defaultName, isDirectory: true)
     }
 
-    private func credentialFile(_ url: URL, provider: AIUsageProvider) throws -> Data {
+    nonisolated private static func credentialFile(_ url: URL, provider: AIUsageProvider) throws -> Data {
         do {
             return try Data(contentsOf: url)
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
@@ -394,18 +435,20 @@ actor AIUsageService {
         return "WorkosCursorSessionToken=\(user)%3A%3A\(token)"
     }
 
-    nonisolated private static func validateClaude(_ data: Data) throws -> String {
+    nonisolated private static func validateClaude(_ data: Data) throws -> (token: String, expiresAt: Date?) {
         guard let root = jsonObject(data),
               let oauth = root["claudeAiOauth"] as? [String: Any],
               let token = oauth["accessToken"] as? String, safeToken(token) else {
             throw AIUsageError.signInRequired(.claude)
         }
+        var expiresAt: Date?
         if let value = oauth["expiresAt"], !(value is NSNull) {
             guard let milliseconds = number(value),
                   let expiry = epochDate(milliseconds / 1000) else {
                 throw AIUsageError.signInRequired(.claude)
             }
             guard expiry > Date() else { throw AIUsageError.expiredCredentials(.claude) }
+            expiresAt = expiry
         }
         if let value = oauth["scopes"], !(value is NSNull) {
             let scopes: [String]
@@ -418,7 +461,7 @@ actor AIUsageService {
             }
             guard scopes.contains("user:profile") else { throw AIUsageError.missingScope }
         }
-        return token
+        return (token, expiresAt)
     }
 
     nonisolated private static func validateCodex(_ data: Data) throws -> (token: String, account: String?) {

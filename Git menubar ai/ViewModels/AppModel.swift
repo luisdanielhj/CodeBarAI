@@ -15,7 +15,11 @@ struct PendingCommit: Identifiable {
 @Observable
 final class AppModel {
     private(set) var repositories: [RepositoryState] = []
-    var selectedRepositoryID: UUID?
+    var selectedRepositoryID: UUID? {
+        didSet {
+            if let state = selectedRepository { recordActivity(for: state) }
+        }
+    }
 
     /// Problem adding a repository, shown on the list screen.
     var addFailure: String?
@@ -70,14 +74,15 @@ final class AppModel {
         repositories.reduce(0) { $0 + ($1.status?.changedFileCount ?? 0) }
     }
 
-    /// Repositories with uncommitted changes come first; each group remains
-    /// alphabetized. This changes presentation only and does not rewrite storage.
+    /// Recent activity takes precedence over whether an older project is dirty.
     var displayedRepositories: [RepositoryState] {
         repositories.sorted { lhs, rhs in
-            let lhsHasChanges = lhs.status?.isClean == false
-            let rhsHasChanges = rhs.status?.isClean == false
-            if lhsHasChanges != rhsHasChanges { return lhsHasChanges }
-            return lhs.repository.name.localizedStandardCompare(rhs.repository.name) == .orderedAscending
+            let lhsDate = lhs.repository.lastWorkedAt ?? .distantPast
+            let rhsDate = rhs.repository.lastWorkedAt ?? .distantPast
+            if lhsDate != rhsDate { return lhsDate > rhsDate }
+            let nameOrder = lhs.repository.name.localizedStandardCompare(rhs.repository.name)
+            if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+            return lhs.repository.path < rhs.repository.path
         }
     }
 
@@ -119,6 +124,15 @@ final class AppModel {
 
         do {
             let status = try await git.status(at: state.repository.url)
+            if let date = await RepositoryActivity.latestChange(
+                in: state.repository.url,
+                changedPaths: status.changes.map(\.path)
+            ) {
+                recordActivity(for: state, at: date)
+            }
+            if let previous = state.status, previous != status {
+                recordActivity(for: state)
+            }
             state.status = status
             state.loadFailure = nil
         } catch let failure as GitFailure {
@@ -136,6 +150,7 @@ final class AppModel {
 
     private func fileSystemDidChange(root: String) {
         guard let state = repositories.first(where: { $0.repository.path == root }) else { return }
+        recordActivity(for: state)
         scheduleRefresh(for: state)
     }
 
@@ -159,6 +174,11 @@ final class AppModel {
         store.save(repositories.map(\.repository))
     }
 
+    private func recordActivity(for state: RepositoryState, at date: Date = Date()) {
+        guard repositories.contains(where: { $0 === state }), state.recordActivity(at: date) else { return }
+        persist()
+    }
+
     private func loadProjectIconIfNeeded(for state: RepositoryState) {
         guard !state.didSearchForProjectIcon else { return }
         state.didSearchForProjectIcon = true
@@ -179,7 +199,7 @@ final class AppModel {
 
         do {
             let root = try await git.repositoryRoot(containing: url)
-            let repository = Repository(path: root)
+            let repository = Repository(path: root, lastWorkedAt: Date())
             if let existing = repositories.first(where: {
                 $0.repository.canonicalPath == repository.canonicalPath
             }) {
@@ -244,6 +264,7 @@ final class AppModel {
 
         let generated = await generator.generate(for: context)
         state.commitMessage = generated.message
+        recordActivity(for: state)
 
     }
 
@@ -324,6 +345,7 @@ final class AppModel {
 
             state.activity = "Committing…"
             try await git.commit(at: state.repository.url, message: message)
+            recordActivity(for: state)
 
             if push {
                 state.activity = "Pushing…"
@@ -366,6 +388,7 @@ final class AppModel {
         do {
             state.activity = "Publishing \(branch)…"
             try await git.publishBranch(at: state.repository.url, branch: branch, remote: remote)
+            recordActivity(for: state)
             state.activity = nil
             state.lastSuccess = "Published \(branch) to \(remote)."
         } catch let failure as GitFailure {
@@ -386,6 +409,7 @@ final class AppModel {
 
     func openInFinder(_ state: RepositoryState) {
         SystemIntegration.openInFinder(state.repository.url)
+        recordActivity(for: state)
     }
 
     func openInTerminal(_ state: RepositoryState) async {
@@ -423,9 +447,11 @@ final class AppModel {
         }
     }
 
-    func openInClaudeCode(_ state: RepositoryState) async {
+    func openInClaudeCode(_ state: RepositoryState, account: AIUsageState? = nil) async {
+        let selected = account ?? usage.selectedClaudeAccount
+        let profile = (account != nil || usage.claudeAccounts.count > 1) ? selected?.claudeProfile : nil
         await handOff(state, named: "Open in Claude Code") {
-            try await SystemIntegration.openInClaudeCode(state.repository.url)
+            try await SystemIntegration.openInClaudeCode(state.repository.url, profile: profile)
         }
     }
 
@@ -446,6 +472,7 @@ final class AppModel {
         actionFailure = nil
         do {
             try await work()
+            recordActivity(for: state)
         } catch {
             let failure = GitFailure(
                 command: command,

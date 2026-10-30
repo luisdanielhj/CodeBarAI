@@ -1,8 +1,16 @@
 import SwiftUI
 
-/// The root list: every added repository with its branch and change count.
+/// Five recent projects by default, with access to the full repository list.
 struct RepositoryListView: View {
     @Environment(AppModel.self) private var model
+    @State private var showingAllRepositories = false
+
+    private let recentLimit = 5
+
+    private var visibleRepositories: [RepositoryState] {
+        let recent = model.displayedRepositories
+        return showingAllRepositories ? recent : Array(recent.prefix(recentLimit))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -71,16 +79,23 @@ struct RepositoryListView: View {
         .padding(.vertical, 10)
     }
 
+    @ViewBuilder
     private var repositoryList: some View {
         ScrollView {
             VStack(spacing: 1) {
-                ForEach(model.displayedRepositories) { state in
+                ForEach(visibleRepositories) { state in
                     RepositoryRow(state: state) {
                         model.selectedRepositoryID = state.id
                     }
                     .contextMenu {
                         Button("Open in Cursor") { Task { await model.openInCursor(state) } }
-                        Button("Open in Claude Code") { Task { await model.openInClaudeCode(state) } }
+                        if model.usage.claudeAccounts.count > 1 {
+                            Menu("Open in Claude Code") {
+                                ClaudeAccountLaunchOptions(repository: state)
+                            }
+                        } else {
+                            Button("Open in Claude Code") { Task { await model.openInClaudeCode(state) } }
+                        }
                         Button("Open in Codex") { Task { await model.openInCodex(state) } }
                         if let server = state.devServer {
                             Divider()
@@ -101,8 +116,25 @@ struct RepositoryListView: View {
         }
         // A ScrollView has no useful ideal height inside a MenuBarExtra window,
         // so AppKit can collapse it to zero even though its rows exist. Reserve
-        // one row of height per repository and start scrolling at eight rows.
-        .frame(height: min(CGFloat(model.repositories.count) * 44 + 12, 400))
+        // one row of height per visible repository; expand into a scrolling list.
+        .frame(height: min(CGFloat(visibleRepositories.count) * 44 + 12, 400))
+
+        if model.repositories.count > recentLimit {
+            Button {
+                showingAllRepositories.toggle()
+            } label: {
+                HStack(spacing: 4) {
+                    Text(showingAllRepositories ? "View less" : "View more (\(model.repositories.count - recentLimit))")
+                    Image(systemName: showingAllRepositories ? "chevron.up" : "chevron.down")
+                }
+                .font(.system(size: 10, weight: .medium))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.accentColor)
+            .padding(.bottom, 4)
+        }
     }
 
     private var emptyState: some View {

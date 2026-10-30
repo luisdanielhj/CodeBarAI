@@ -4,7 +4,11 @@ import Observation
 @Observable
 final class AIUsageState: Identifiable {
     let provider: AIUsageProvider
-    var id: String { provider.id }
+    var claudeProfile: ClaudeAccountProfile?
+    var id: String { claudeProfile?.id ?? provider.id }
+    var title: String {
+        claudeProfile.map { "Claude · \($0.name)" } ?? provider.title
+    }
     var isInstalled: Bool
     var isEnabled: Bool
     var isRefreshing = false
@@ -13,8 +17,9 @@ final class AIUsageState: Identifiable {
     var nextRefreshAt = Date.distantPast
     var generation = UUID()
 
-    init(provider: AIUsageProvider, isInstalled: Bool, isEnabled: Bool) {
+    init(provider: AIUsageProvider, isInstalled: Bool, isEnabled: Bool, claudeProfile: ClaudeAccountProfile? = nil) {
         self.provider = provider
+        self.claudeProfile = claudeProfile
         self.isInstalled = isInstalled
         self.isEnabled = isEnabled
     }
@@ -22,13 +27,27 @@ final class AIUsageState: Identifiable {
 
 @Observable
 final class AIUsageModel {
-    let states: [AIUsageState]
-    private let service = AIUsageService()
+    private(set) var states: [AIUsageState]
+    private(set) var selectedClaudeAccountID: String
+    private(set) var menuBarAccountOrder: [String]
+    private(set) var menuBarVisibleAccountIDs: Set<String>
+    private let service: any AIUsageLoading
     private let defaults: UserDefaults
+    private let home: URL
     @ObservationIgnored private var autoRefreshTask: Task<Void, Never>?
 
-    init(defaults: UserDefaults = .standard) {
+    init(
+        defaults: UserDefaults = .standard,
+        service: any AIUsageLoading = AIUsageService(),
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) {
         self.defaults = defaults
+        self.service = service
+        self.home = home
+        selectedClaudeAccountID = defaults.string(forKey: "usage.claude.selectedAccount") ?? "claude"
+        menuBarAccountOrder = defaults.stringArray(forKey: "usage.menuBar.accountOrder") ?? []
+        menuBarVisibleAccountIDs = Set(defaults.stringArray(forKey: "usage.menuBar.visibleAccounts") ?? [])
         states = AIUsageProvider.allCases.map { provider in
             let key = "usage.enabled.\(provider.rawValue)"
             let isInstalled = provider.isInstalled
@@ -38,14 +57,175 @@ final class AIUsageModel {
             return AIUsageState(
                 provider: provider,
                 isInstalled: isInstalled,
-                isEnabled: isEnabled
+                isEnabled: isEnabled,
+                claudeProfile: provider == .claude ? .current(home: home, environment: environment) : nil
             )
+        }
+        let saved = defaults.data(forKey: "usage.claude.accounts")
+            .flatMap { try? JSONDecoder().decode([ClaudeAccountProfile].self, from: $0) } ?? []
+        for profile in saved where !profile.isDefault {
+            appendClaudeAccount(profile)
+        }
+        discoverClaudeAccounts()
+        if !claudeAccounts.contains(where: { $0.id == selectedClaudeAccountID }) {
+            selectedClaudeAccountID = "claude"
+        }
+        // Preserve the previous single-Claude layout when upgrading. An empty
+        // saved selection is intentional and leaves the repository icon visible.
+        if defaults.object(forKey: "usage.menuBar.visibleAccounts") == nil {
+            menuBarVisibleAccountIDs = Set(states.filter {
+                $0.provider != .claude || $0.id == selectedClaudeAccountID
+            }.map(\.id))
+        }
+        menuBarVisibleAccountIDs.formIntersection(states.map(\.id))
+        saveMenuBarPreferences()
+    }
+
+    var claudeAccounts: [AIUsageState] { states.filter { $0.provider == .claude } }
+
+    var selectedClaudeAccount: AIUsageState? {
+        claudeAccounts.first { $0.id == selectedClaudeAccountID } ?? claudeAccounts.first
+    }
+
+    /// The organizer includes hidden accounts so they can be shown again
+    /// without reconnecting or changing a Claude launch preference.
+    var menuBarAccountStates: [AIUsageState] {
+        let accounts = Dictionary(uniqueKeysWithValues: states.map { ($0.id, $0) })
+        return menuBarAccountOrder.compactMap { accounts[$0] }
+    }
+
+    var menuBarStates: [AIUsageState] {
+        menuBarAccountStates.filter { isShownInMenuBar($0) }
+    }
+
+    func isShownInMenuBar(_ state: AIUsageState) -> Bool {
+        menuBarVisibleAccountIDs.contains(state.id)
+    }
+
+    func setMenuBarVisibility(_ state: AIUsageState, isVisible: Bool) {
+        guard states.contains(where: { $0 === state }) else { return }
+        if isVisible {
+            menuBarVisibleAccountIDs.insert(state.id)
+        } else {
+            menuBarVisibleAccountIDs.remove(state.id)
+        }
+        saveMenuBarPreferences()
+    }
+
+    func moveMenuBarAccount(_ state: AIUsageState, by offset: Int) {
+        guard states.contains(where: { $0 === state }),
+              let index = menuBarAccountOrder.firstIndex(of: state.id) else { return }
+        let destination = index + offset
+        guard menuBarAccountOrder.indices.contains(destination) else { return }
+        menuBarAccountOrder.remove(at: index)
+        menuBarAccountOrder.insert(state.id, at: destination)
+        saveMenuBarPreferences()
+    }
+
+    private func synchronizeMenuBarOrder() {
+        let providerOrder: [AIUsageProvider: Int] = [.claude: 0, .codex: 1, .cursor: 2]
+        let standardOrder = states.enumerated().sorted { lhs, rhs in
+            let lhsOrder = providerOrder[lhs.element.provider, default: .max]
+            let rhsOrder = providerOrder[rhs.element.provider, default: .max]
+            return lhsOrder == rhsOrder ? lhs.offset < rhs.offset : lhsOrder < rhsOrder
+        }.map { $0.element.id }
+        let available = Set(standardOrder)
+        var seen = Set<String>()
+        menuBarAccountOrder = (menuBarAccountOrder + standardOrder).filter {
+            available.contains($0) && seen.insert($0).inserted
+        }
+        defaults.set(menuBarAccountOrder, forKey: "usage.menuBar.accountOrder")
+    }
+
+    private func saveMenuBarPreferences() {
+        defaults.set(menuBarAccountOrder, forKey: "usage.menuBar.accountOrder")
+        defaults.set(menuBarAccountOrder.filter { menuBarVisibleAccountIDs.contains($0) },
+                     forKey: "usage.menuBar.visibleAccounts")
+    }
+
+    func selectClaudeAccount(_ state: AIUsageState) {
+        guard state.provider == .claude, states.contains(where: { $0 === state }) else { return }
+        selectedClaudeAccountID = state.id
+        defaults.set(state.id, forKey: "usage.claude.selectedAccount")
+    }
+
+    func renameClaudeAccount(_ state: AIUsageState, to name: String) {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, state.claudeProfile != nil else { return }
+        state.claudeProfile?.name = String(name.prefix(60))
+        if state.claudeProfile?.isDefault == true {
+            defaults.set(state.claudeProfile?.name, forKey: "usage.claude.defaultName")
+        }
+        saveClaudeAccounts()
+    }
+
+    @discardableResult
+    func addClaudeAccount(directory: URL) -> AIUsageState {
+        let profile = ClaudeAccountProfile(directory: directory)
+        let state = appendClaudeAccount(profile)
+        var hidden = defaults.stringArray(forKey: "usage.claude.hiddenAccounts") ?? []
+        hidden.removeAll { $0 == profile.id }
+        defaults.set(hidden, forKey: "usage.claude.hiddenAccounts")
+        synchronizeMenuBarOrder()
+        saveClaudeAccounts()
+        return state
+    }
+
+    func removeClaudeAccount(_ state: AIUsageState) {
+        guard let profile = state.claudeProfile, !profile.isDefault else { return }
+        disconnect(state)
+        states.removeAll { $0 === state }
+        menuBarVisibleAccountIDs.remove(state.id)
+        synchronizeMenuBarOrder()
+        saveMenuBarPreferences()
+        var hidden = defaults.stringArray(forKey: "usage.claude.hiddenAccounts") ?? []
+        if !hidden.contains(profile.id) { hidden.append(profile.id) }
+        defaults.set(hidden, forKey: "usage.claude.hiddenAccounts")
+        if selectedClaudeAccountID == state.id, let fallback = claudeAccounts.first {
+            selectClaudeAccount(fallback)
+        }
+        saveClaudeAccounts()
+    }
+
+    func discoverClaudeAccounts() {
+        let hidden = Set(defaults.stringArray(forKey: "usage.claude.hiddenAccounts") ?? [])
+        for profile in ClaudeAccountProfile.discover(home: home) where !hidden.contains(profile.id) {
+            appendClaudeAccount(profile)
+        }
+        if let name = defaults.string(forKey: "usage.claude.defaultName") {
+            claudeAccounts.first { $0.claudeProfile?.isDefault == true }?.claudeProfile?.name = name
+        }
+        synchronizeMenuBarOrder()
+        saveClaudeAccounts()
+    }
+
+    @discardableResult
+    private func appendClaudeAccount(_ profile: ClaudeAccountProfile) -> AIUsageState {
+        if let existing = claudeAccounts.first(where: {
+            $0.claudeProfile?.configDirectory == profile.configDirectory
+                && $0.claudeProfile?.keychainService == profile.keychainService
+        }) { return existing }
+        let key = "usage.enabled.\(profile.id)"
+        let enabled = defaults.object(forKey: key) == nil
+            ? (defaults.object(forKey: "usage.enabled.claude") == nil || defaults.bool(forKey: "usage.enabled.claude"))
+            : defaults.bool(forKey: key)
+        let state = AIUsageState(provider: .claude, isInstalled: true, isEnabled: enabled, claudeProfile: profile)
+        defaults.set(enabled, forKey: key)
+        let insertionIndex = states.lastIndex { $0.provider == .claude }.map { $0 + 1 } ?? 0
+        states.insert(state, at: insertionIndex)
+        return state
+    }
+
+    private func saveClaudeAccounts() {
+        let profiles = claudeAccounts.compactMap(\.claudeProfile).filter { !$0.isDefault }
+        if let data = try? JSONEncoder().encode(profiles) {
+            defaults.set(data, forKey: "usage.claude.accounts")
         }
     }
 
     func connect(_ state: AIUsageState) async {
         state.isEnabled = true
-        defaults.set(true, forKey: "usage.enabled.\(state.provider.rawValue)")
+        defaults.set(true, forKey: "usage.enabled.\(state.id)")
         await refresh(state)
     }
 
@@ -56,7 +236,7 @@ final class AIUsageModel {
         state.snapshot = nil
         state.failure = nil
         state.nextRefreshAt = .distantPast
-        defaults.set(false, forKey: "usage.enabled.\(state.provider.rawValue)")
+        defaults.set(false, forKey: "usage.enabled.\(state.id)")
     }
 
     /// Keeps usage current for the status item, which has no view lifecycle of
@@ -72,6 +252,7 @@ final class AIUsageModel {
     }
 
     func refreshAll() async {
+        discoverClaudeAccounts()
         refreshInstalledProviders()
         await withTaskGroup(of: Void.self) { group in
             for state in states where state.isEnabled {
@@ -84,10 +265,12 @@ final class AIUsageModel {
 
     private func refreshInstalledProviders() {
         for state in states {
-            let isInstalled = state.provider.isInstalled
+            let isInstalled = state.claudeProfile.map {
+                FileManager.default.fileExists(atPath: $0.configDirectory.path) || state.provider.isInstalled
+            } ?? state.provider.isInstalled
             state.isInstalled = isInstalled
 
-            let key = "usage.enabled.\(state.provider.rawValue)"
+            let key = "usage.enabled.\(state.id)"
             if defaults.object(forKey: key) == nil {
                 state.isEnabled = isInstalled
             }
@@ -102,7 +285,7 @@ final class AIUsageModel {
             if state.generation == generation { state.isRefreshing = false }
         }
         do {
-            let snapshot = try await service.load(state.provider)
+            let snapshot = try await service.load(state.provider, claudeProfile: state.claudeProfile)
             guard state.isEnabled, state.generation == generation else { return }
             state.snapshot = snapshot
             state.failure = nil

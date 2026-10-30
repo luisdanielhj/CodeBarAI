@@ -15,11 +15,13 @@ A macOS menu bar app for developers who work with AI coding tools. It shows how 
   - **Cursor**: Auto and API usage for the current billing cycle, plus the amount spent against your limit
 - Finds installed tools on its own and refreshes usage in the background. It backs off after errors and follows `Retry-After` when a provider rate-limits it.
 - Connect or disconnect each provider separately.
-- If no provider is installed, the status item shows how many files have changed across your repositories.
+- **Multiple Claude accounts**: discovers account folders such as `~/.claude-work` and `~/.claude-account-2`, with separate usage, refresh times, and connect/disconnect controls. Add other config folders with **Add Claude Account…** and rename them from their **⋯** menus.
+- **Organize Menu Bar…** lets you check any combination of accounts and use the arrows to set their order, including Claude, Codex, and Cursor. Visibility and order are saved between launches. Multiple Claude accounts use small numbered badges inside their logos; hover to see their full names. Numbers stay with their accounts when you reorder or hide them.
+- If no installed account is selected for display, the status item shows how many files have changed across your repositories.
 
 ### Git from the menu bar
 - Add any local Git repository. It's watched with FSEvents, so status updates as soon as files change.
-- Repositories with uncommitted changes are listed first. Each row shows the branch, ahead/behind counts and the number of changed files.
+- Shows the **five most recently worked on projects**, based on local changes and activity in CodeBarAI. **View more** expands the full list, and **View less** returns to five. Recency is saved between launches. Each row shows the branch, ahead/behind counts and the number of changed files.
 - **Commit** or **Commit & Push** in one click (`git add -A`, `git commit`, `git push`).
 - **Publish** a branch that has no upstream yet (`git push --set-upstream`).
 - Clear warnings for merge conflicts, a detached HEAD, a merge/rebase/cherry-pick in progress, or a branch with no remote.
@@ -33,6 +35,7 @@ A macOS menu bar app for developers who work with AI coding tools. It shows how 
 ### Jump into your tools
 - Open a repository (or one changed file) in **Cursor**.
 - Start a **Claude Code** session for the repository in a new Terminal window.
+- When multiple Claude accounts are configured, the **Claude Code** button and repository context menu let you choose the account for each new session. Existing sessions keep their account.
 - Open the repository in the **Codex** desktop app.
 - **Start Server**: finds a `dev`, `start` or `serve` script in `package.json`, works out the package manager (npm, pnpm, yarn or bun) from the `packageManager` field or the lockfile, installs dependencies if `node_modules` is missing, and runs the script in Terminal.
 - Open the repository in Finder or Terminal.
@@ -66,6 +69,26 @@ To build from the command line:
 xcodebuild -project "Git menubar ai.xcodeproj" -scheme CodeBarAI -configuration Release build
 ```
 
+To run the isolated multi-account checks (no live credentials or provider requests):
+
+```bash
+bash scripts/test-claude-accounts.sh
+```
+
+### Using multiple Claude accounts
+
+Each account needs its own Claude Code config directory, as described in [Claude Code's authentication guide](https://code.claude.com/docs/en/authentication#log-in-with-multiple-accounts). For example, sign in to a second account with:
+
+```bash
+CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude auth login
+```
+
+CodeBarAI discovers `~/.claude-*` folders containing Claude config files. For folders elsewhere, use **Add Claude Account…** and choose the directory used by `CLAUDE_CONFIG_DIR`. Each account's **⋯** menu provides **Rename Account…**, **Show in Menu Bar**, and **Disconnect**. Removing an added account from CodeBarAI leaves its Claude files and Keychain credentials intact; add the folder again to restore it.
+
+Click **Organize Menu Bar…** above the usage cards to show several accounts at once, hide accounts, and arrange them with the arrow buttons. Click **Done** to return to usage. Hiding an account keeps it connected and available in the Claude Code launch picker. Newly discovered accounts are available in the organizer for you to select.
+
+Choosing an account starts Claude with that account's config and Keychain location, clearing inherited API keys, bearer/OAuth tokens, and cloud-provider switches for that new process. Account-specific and managed Claude settings still apply.
+
 ## Permissions
 
 CodeBarAI is **not sandboxed**, because it needs to run `git` and read your AI tools' local sign-in data. macOS may ask you for:
@@ -79,14 +102,14 @@ The usage numbers come from your own subscription accounts, using the sign-in da
 
 | Provider    | Where credentials are read from                                                      | Sent to                                      |
 |-------------|--------------------------------------------------------------------------------------|----------------------------------------------|
-| Claude Code | `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`), then Keychain `Claude Code-credentials` | `api.anthropic.com/api/oauth/usage`          |
+| Claude Code | Each account's `.credentials.json`, then its own Keychain entry (`Claude Code-credentials` for the default login, or a directory-specific entry for a custom config folder) | `api.anthropic.com/api/oauth/usage` |
 | Codex       | `~/.codex/auth.json` (or `$CODEX_HOME`), then Keychain `Codex Auth`                   | `chatgpt.com/backend-api/wham/usage`         |
 | Cursor      | Cursor's local `state.vscdb` (read-only)                                              | `cursor.com/api/usage-summary`               |
 
 - Each token is sent **only** to its own provider's usage endpoint. CodeBarAI never saves, logs or forwards it anywhere else.
 - Requests use an ephemeral `URLSession` with no cookies and no cache. **Redirects are refused**, so a token can't be sent on to another host.
 - A provider's credentials are only read when that provider is enabled. You can disconnect any provider from the usage view.
-- Your repository list is kept in `UserDefaults`. There is no analytics or telemetry.
+- Your repository list, Claude account folder paths and labels, and menu bar account visibility and order are kept in `UserDefaults`. Tokens are held only in memory. There is no analytics or telemetry.
 
 > **Note:** These usage endpoints are not public, documented APIs. Providers can change them without notice, and a provider may then show "unsupported usage response" until the app is updated. CodeBarAI is not affiliated with Anthropic, OpenAI or Cursor.
 

@@ -4,7 +4,7 @@ import Foundation
 /// commit the user is composing.
 @Observable
 final class RepositoryState: Identifiable {
-    let repository: Repository
+    private(set) var repository: Repository
 
     /// Last successful `git status` snapshot, or `nil` before the first refresh.
     var status: GitStatus?
@@ -36,6 +36,14 @@ final class RepositoryState: Identifiable {
 
     init(repository: Repository) {
         self.repository = repository
+    }
+
+    /// Older filesystem timestamps must not undo a more recent explicit open.
+    @discardableResult
+    func recordActivity(at date: Date = Date()) -> Bool {
+        guard date > (repository.lastWorkedAt ?? .distantPast) else { return false }
+        repository.lastWorkedAt = date
+        return true
     }
 
     var isBusy: Bool { activity != nil }

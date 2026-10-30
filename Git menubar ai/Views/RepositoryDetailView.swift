@@ -152,8 +152,29 @@ struct RepositoryDetailView: View {
             FooterButton(title: "Cursor", assetImage: "CursorLogo") {
                 Task { await model.openInCursor(state) }
             }
-            FooterButton(title: "Claude Code", assetImage: "ClaudeLogo") {
-                Task { await model.openInClaudeCode(state) }
+            if model.usage.claudeAccounts.count > 1 {
+                Menu {
+                    ClaudeAccountLaunchOptions(repository: state)
+                } label: {
+                    Label {
+                        Text("Claude Code")
+                    } icon: {
+                        Image("ClaudeLogo")
+                            .renderingMode(.template)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 11, height: 11)
+                    }
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Choose a Claude account")
+            } else {
+                FooterButton(title: "Claude Code", assetImage: "ClaudeLogo") {
+                    Task { await model.openInClaudeCode(state) }
+                }
             }
             FooterButton(title: "Codex", assetImage: "CodexLogo") {
                 Task { await model.openInCodex(state) }
@@ -167,6 +188,21 @@ struct RepositoryDetailView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
+    }
+}
+
+/// Shared by the repository context menu and the detail footer, so choosing
+/// an account always launches that profile without changing any other login.
+struct ClaudeAccountLaunchOptions: View {
+    @Environment(AppModel.self) private var model
+    let repository: RepositoryState
+
+    var body: some View {
+        ForEach(model.usage.claudeAccounts) { account in
+            Button(account.claudeProfile?.name ?? "Default") {
+                Task { await model.openInClaudeCode(repository, account: account) }
+            }
+        }
     }
 }
 
