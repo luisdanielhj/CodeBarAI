@@ -33,6 +33,7 @@ final class AppModel {
     var pendingCommit: PendingCommit?
 
     let usage = AIUsageModel()
+    let servers = RunningServersModel()
 
     private let git = GitClient.shared
     private let store = RepositoryStore()

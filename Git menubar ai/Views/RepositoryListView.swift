@@ -4,6 +4,7 @@ import SwiftUI
 struct RepositoryListView: View {
     @Environment(AppModel.self) private var model
     @State private var showingAllRepositories = false
+    @State private var contentHeight: CGFloat = 500
 
     private let recentLimit = 5
 
@@ -13,6 +14,15 @@ struct RepositoryListView: View {
     }
 
     var body: some View {
+        ScrollView {
+            content
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+                .syncScrollerAppearance()
+        }
+        .frame(height: min(contentHeight, max(300, (NSScreen.main?.visibleFrame.height ?? 800) - 32)))
+    }
+
+    private var content: some View {
         VStack(spacing: 0) {
             header
 
@@ -52,6 +62,8 @@ struct RepositoryListView: View {
 
             Divider().opacity(0.5)
             AIUsageView(model: model.usage)
+            Divider().opacity(0.5)
+            RunningServersView(model: model.servers, projects: model.repositories.map(\.repository))
             Divider().opacity(0.5)
             footer
         }

@@ -27,6 +27,12 @@ A macOS menu bar app for developers who work with AI coding tools. It shows how 
 - Clear warnings for merge conflicts, a detached HEAD, a merge/rebase/cherry-pick in progress, or a branch with no remote.
 - **Sensitive file check**: before committing, CodeBarAI warns you if `git add -A` would include files like `.env`, `id_rsa`, `*.pem`, `*.p12` or `credentials.json`, and asks you to confirm.
 
+### Running servers
+- A third section shows local development servers started from Terminal or CodeBarAI, including Node/npm/npx, Bun, Deno, Python, and other common runtimes. It also finds server binaries running inside your added projects.
+- Each entry shows its project or folder, runtime, and listening TCP ports. Related npm/npx launcher and child processes are grouped into one entry.
+- **Stop** sends a graceful termination request to that server job. **Force Stop** becomes available if it does not shut down. Other terminal jobs and other users' processes are excluded from termination.
+- The **⋯** menu opens a local server in your browser or reveals its project folder. The list refreshes every five seconds while the section is active.
+
 ### Commit message generation
 - Writes a [Conventional Commit](https://www.conventionalcommits.org/) subject line (`type(scope): summary`) from the changed files and a short excerpt of the diff.
 - Uses **Apple Foundation Models** (Apple Intelligence) when it's available. Otherwise it falls back to a local heuristic based on file paths, branch names and diff stats.
@@ -75,6 +81,12 @@ To run the isolated multi-account checks (no live credentials or provider reques
 bash scripts/test-claude-accounts.sh
 ```
 
+To check server discovery and graceful/forced shutdown using temporary Node servers (requires Node.js):
+
+```bash
+bash scripts/test-running-servers.sh
+```
+
 ### Using multiple Claude accounts
 
 Each account needs its own Claude Code config directory, as described in [Claude Code's authentication guide](https://code.claude.com/docs/en/authentication#log-in-with-multiple-accounts). For example, sign in to a second account with:
@@ -110,6 +122,7 @@ The usage numbers come from your own subscription accounts, using the sign-in da
 - Requests use an ephemeral `URLSession` with no cookies and no cache. **Redirects are refused**, so a token can't be sent on to another host.
 - A provider's credentials are only read when that provider is enabled. You can disconnect any provider from the usage view.
 - Your repository list, Claude account folder paths and labels, and menu bar account visibility and order are kept in `UserDefaults`. Tokens are held only in memory. There is no analytics or telemetry.
+- Running-server discovery reads local process and socket metadata. Server command arguments and environment values are never displayed, logged, persisted, or sent anywhere.
 
 > **Note:** These usage endpoints are not public, documented APIs. Providers can change them without notice, and a provider may then show "unsupported usage response" until the app is updated. CodeBarAI is not affiliated with Anthropic, OpenAI or Cursor.
 
