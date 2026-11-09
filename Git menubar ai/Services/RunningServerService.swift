@@ -96,7 +96,7 @@ actor RunningServerService: RunningServerServicing {
         guard actual > 0 else { throw RunningServerError.inspectionUnavailable }
         var result: [Int32: ProcessRecord] = [:]
         for pid in pids.prefix(min(Int(actual), pids.count)) where pid > 1 && pid != getpid() {
-            guard let identity = identity(pid: pid), let info = bsdInfo(pid: pid) else { continue }
+            guard let info = bsdInfo(pid: pid), let identity = identity(pid: pid, info: info) else { continue }
             result[pid] = ProcessRecord(identity: identity, parentID: Int32(info.pbi_ppid), directory: workingDirectory(pid: pid))
         }
         return result
@@ -112,6 +112,12 @@ actor RunningServerService: RunningServerServicing {
 
     nonisolated private static func identity(pid: Int32) -> ServerProcessIdentity? {
         guard pid > 1, pid != getpid(), let info = bsdInfo(pid: pid) else { return nil }
+        return identity(pid: pid, info: info)
+    }
+
+    /// Builds the identity from BSD info the caller already read, so a full
+    /// process scan makes one `proc_pidinfo` call per process instead of two.
+    nonisolated private static func identity(pid: Int32, info: proc_bsdinfo) -> ServerProcessIdentity? {
         // PROC_PIDPATHINFO_MAXSIZE is a sizeof-based C macro Swift cannot import.
         var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
         guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return nil }

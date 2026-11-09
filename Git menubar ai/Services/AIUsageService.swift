@@ -4,7 +4,7 @@ import SQLite3
 import CryptoKit
 
 nonisolated enum AIUsageProvider: String, CaseIterable, Identifiable, Sendable {
-    case claude, cursor, codex
+    case claude, cursor, codex, kiro
 
     var id: String { rawValue }
 
@@ -13,6 +13,7 @@ nonisolated enum AIUsageProvider: String, CaseIterable, Identifiable, Sendable {
         case .claude: return "Claude Code"
         case .cursor: return "Cursor"
         case .codex: return "Codex"
+        case .kiro: return "Kiro CLI"
         }
     }
 
@@ -21,6 +22,7 @@ nonisolated enum AIUsageProvider: String, CaseIterable, Identifiable, Sendable {
         case .claude: return "ClaudeLogo"
         case .cursor: return "CursorLogo"
         case .codex: return "CodexLogo"
+        case .kiro: return "KiroLogo"
         }
     }
 
@@ -32,6 +34,8 @@ nonisolated enum AIUsageProvider: String, CaseIterable, Identifiable, Sendable {
             return "Sign in to the Cursor desktop app to read your subscription usage."
         case .codex:
             return "Sign in to Codex with ChatGPT. API keys do not provide subscription limits."
+        case .kiro:
+            return "Sign in with kiro-cli login. API keys do not provide plan credits."
         }
     }
 
@@ -67,6 +71,14 @@ nonisolated enum AIUsageProvider: String, CaseIterable, Identifiable, Sendable {
                 home.appendingPathComponent("Applications/Codex.app", isDirectory: true),
                 URL(fileURLWithPath: "/Applications/Codex.app", isDirectory: true)
             ]
+        case .kiro:
+            // ~/.kiro is shared with the Kiro IDE, so it does not imply the CLI.
+            executable = "kiro-cli"
+            candidates = [
+                home.appendingPathComponent("Library/Application Support/kiro-cli", isDirectory: true),
+                home.appendingPathComponent(".local/bin/kiro-cli"),
+                URL(fileURLWithPath: "/Applications/Kiro CLI.app", isDirectory: true)
+            ]
         }
 
         if candidates.contains(where: { files.fileExists(atPath: $0.path) }) {
@@ -87,6 +99,8 @@ nonisolated struct AIUsageWindow: Identifiable, Sendable {
     let usedPercent: Double?
     let resetsAt: Date?
     let detail: String?
+    /// Length of the limit window, used to show how much of it has elapsed.
+    var duration: TimeInterval? = nil
 }
 
 nonisolated struct AIUsageSnapshot: Sendable {
@@ -149,6 +163,9 @@ actor AIUsageService: AIUsageLoading {
     /// Each account owns a separate cache entry. A rejection must never evict
     /// another account's token or make a refresh fall back to that account.
     private var claudeCache: [String: (token: String, expiresAt: Date?)] = [:]
+    /// Last time `kiro-cli` was asked to renew its expired sign-in, so a
+    /// broken login does not launch the CLI on every refresh.
+    private var kiroRenewalAttemptedAt: Date?
 
     func load(_ provider: AIUsageProvider, claudeProfile: ClaudeAccountProfile? = nil) async throws -> AIUsageSnapshot {
         let profile = claudeProfile ?? .current()
@@ -212,20 +229,22 @@ actor AIUsageService: AIUsageLoading {
         guard let root = jsonObject(data) else { throw AIUsageError.invalidResponse }
         switch provider {
         case .claude:
-            let definitions = [
-                ("five_hour", "5 hours"),
-                ("seven_day", "7 days"),
-                ("seven_day_sonnet", "Sonnet · 7 days"),
-                ("seven_day_opus", "Opus · 7 days")
+            let week: TimeInterval = 7 * 86_400
+            let definitions: [(String, String, TimeInterval)] = [
+                ("five_hour", "5 hours", 5 * 3_600),
+                ("seven_day", "7 days", week),
+                ("seven_day_sonnet", "Sonnet · 7 days", week),
+                ("seven_day_opus", "Opus · 7 days", week)
             ]
-            let windows = definitions.compactMap { key, title -> AIUsageWindow? in
+            let windows = definitions.compactMap { key, title, duration -> AIUsageWindow? in
                 guard let window = root[key] as? [String: Any] else { return nil }
                 return AIUsageWindow(
                     id: key,
                     title: title,
                     usedPercent: nonnegative(window["utilization"]),
                     resetsAt: isoDate(window["resets_at"]),
-                    detail: nil
+                    detail: nil,
+                    duration: duration
                 )
             }
             return AIUsageSnapshot(plan: nil, windows: windows, fetchedAt: now)
@@ -239,41 +258,61 @@ actor AIUsageService: AIUsageLoading {
                     title: durationTitle(window["limit_window_seconds"]) ?? fallback,
                     usedPercent: nonnegative(window["used_percent"]),
                     resetsAt: epochDate(window["reset_at"]),
-                    detail: nil
+                    detail: nil,
+                    duration: number(window["limit_window_seconds"]).flatMap { $0 > 0 ? $0 : nil }
                 )
             }
             return AIUsageSnapshot(plan: displayText(root["plan_type"]), windows: windows, fetchedAt: now)
         case .cursor:
             return parseCursor(root, now: now)
+        case .kiro:
+            return parseKiro(root, now: now)
         }
     }
 
     private func makeRequest(for provider: AIUsageProvider, claudeProfile: ClaudeAccountProfile) async throws -> URLRequest {
-        let endpoint: String
-        switch provider {
-        case .claude: endpoint = "https://api.anthropic.com/api/oauth/usage"
-        case .cursor: endpoint = "https://cursor.com/api/usage-summary"
-        case .codex: endpoint = "https://chatgpt.com/backend-api/wham/usage"
-        }
-        guard let url = URL(string: endpoint) else { throw AIUsageError.invalidResponse }
-        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
-        request.httpMethod = "GET"
-        request.httpShouldHandleCookies = false
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
         switch provider {
         case .claude:
+            var request = try Self.usageRequest("https://api.anthropic.com/api/oauth/usage")
             request.setValue("Bearer \(try await claudeToken(for: claudeProfile))", forHTTPHeaderField: "Authorization")
             request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
             request.setValue("claude-code/2.1.0", forHTTPHeaderField: "User-Agent")
+            return request
         case .codex:
+            var request = try Self.usageRequest("https://chatgpt.com/backend-api/wham/usage")
             let credentials = try codexCredentials()
             request.setValue("Bearer \(credentials.token)", forHTTPHeaderField: "Authorization")
             if let account = credentials.account {
                 request.setValue(account, forHTTPHeaderField: "ChatGPT-Account-Id")
             }
+            return request
         case .cursor:
+            var request = try Self.usageRequest("https://cursor.com/api/usage-summary")
             request.setValue(try cursorCookie(), forHTTPHeaderField: "Cookie")
+            return request
+        case .kiro:
+            let credentials = try await kiroCredentials()
+            var components = URLComponents()
+            components.scheme = "https"
+            components.host = "q.\(credentials.region).amazonaws.com"
+            components.path = "/getUsageLimits"
+            components.queryItems = [
+                URLQueryItem(name: "origin", value: "AI_EDITOR"),
+                URLQueryItem(name: "resourceType", value: "AGENTIC_REQUEST")
+            ] + (credentials.profileArn.map { [URLQueryItem(name: "profileArn", value: $0)] } ?? [])
+            guard let endpoint = components.string else { throw AIUsageError.invalidResponse }
+            var request = try Self.usageRequest(endpoint)
+            request.setValue("Bearer \(credentials.token)", forHTTPHeaderField: "Authorization")
+            return request
         }
+    }
+
+    nonisolated private static func usageRequest(_ endpoint: String) throws -> URLRequest {
+        guard let url = URL(string: endpoint) else { throw AIUsageError.invalidResponse }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
+        request.httpMethod = "GET"
+        request.httpShouldHandleCookies = false
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
         return request
     }
 
@@ -435,6 +474,146 @@ actor AIUsageService: AIUsageLoading {
         return "WorkosCursorSessionToken=\(user)%3A%3A\(token)"
     }
 
+    nonisolated struct KiroCredentials: Sendable {
+        let token: String
+        let expiresAt: Date?
+        let region: String
+        let profileArn: String?
+    }
+
+    /// The access token lasts about an hour and Kiro CLI renews it only while
+    /// it runs. Renewal is left to the CLI: refreshing here would rotate the
+    /// refresh token behind its back and sign it out. `kiro-cli whoami` loads
+    /// the saved login, which renews and saves an expired token.
+    private func kiroCredentials() async throws -> KiroCredentials {
+        let database = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/kiro-cli/data.sqlite3")
+        let credentials = try Self.readKiroCredentials(database: database)
+        if credentials.expiresAt.map({ $0 > Date().addingTimeInterval(60) }) ?? true {
+            return credentials
+        }
+        guard kiroRenewalAttemptedAt.map({ Date().timeIntervalSince($0) > 600 }) ?? true,
+              let executable = Self.kiroExecutable() else {
+            throw AIUsageError.expiredCredentials(.kiro)
+        }
+        kiroRenewalAttemptedAt = Date()
+        _ = try? await ProcessRunner.run(
+            executableURL: executable,
+            arguments: ["whoami", "--format", "json"],
+            timeout: 20
+        )
+        let renewed = try Self.readKiroCredentials(database: database)
+        guard renewed.expiresAt.map({ $0 > Date() }) ?? true else {
+            throw AIUsageError.expiredCredentials(.kiro)
+        }
+        return renewed
+    }
+
+    nonisolated private static func kiroExecutable() -> URL? {
+        let files = FileManager.default
+        let candidates = [
+            files.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/kiro-cli"),
+            URL(fileURLWithPath: "/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli"),
+            URL(fileURLWithPath: "/opt/homebrew/bin/kiro-cli"),
+            URL(fileURLWithPath: "/usr/local/bin/kiro-cli")
+        ] + (ProcessInfo.processInfo.environment["PATH"]?
+            .split(separator: ":")
+            .map { URL(fileURLWithPath: String($0), isDirectory: true).appendingPathComponent("kiro-cli") } ?? [])
+        return candidates.first { files.isExecutableFile(atPath: $0.path) }
+    }
+
+    nonisolated static func readKiroCredentials(database url: URL) throws -> KiroCredentials {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw AIUsageError.signInRequired(.kiro)
+        }
+        var database: OpaquePointer?
+        let result = sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil)
+        defer { if let database { sqlite3_close(database) } }
+        guard result == SQLITE_OK, let database else {
+            throw AIUsageError.credentialAccessDenied(.kiro)
+        }
+        sqlite3_busy_timeout(database, 1000)
+
+        // Each login method (IAM Identity Center, social, external IdP) saves
+        // its token under its own key. Use the one that lasts longest.
+        let tokens = try ["kirocli:odic:token", "kirocli:social:token", "kirocli:external-idp:token"]
+            .compactMap { try kiroValue(database, table: "auth_kv", key: $0) }
+            .compactMap { jsonObject($0) }
+            .compactMap { root -> ([String: Any], String, Date?)? in
+                guard let token = (root["access_token"] ?? root["accessToken"]) as? String,
+                      safeKiroToken(token) else { return nil }
+                let expiry = root["expires_at"] ?? root["expiresAt"]
+                return (root, token, flexibleDate(expiry))
+            }
+        guard let best = tokens.max(by: {
+            ($0.2 ?? .distantPast) < ($1.2 ?? .distantPast)
+        }) else {
+            throw AIUsageError.signInRequired(.kiro)
+        }
+        let (root, token, expiresAt) = best
+
+        let profile = try kiroValue(database, table: "state", key: "api.codewhisperer.profile")
+            .flatMap { jsonObject($0) }
+        let profileArn = [root["profile_arn"], root["profileArn"], profile?["arn"]]
+            .compactMap { $0 as? String }
+            .first(where: safeArn)
+        let arnRegion = profileArn.map { $0.split(separator: ":", omittingEmptySubsequences: false) }
+            .flatMap { $0.count > 3 ? String($0[3]) : nil }
+        let region = [arnRegion, root["region"] as? String].compactMap { $0 }.first(where: safeRegion) ?? "us-east-1"
+        return KiroCredentials(token: token, expiresAt: expiresAt, region: region, profileArn: profileArn)
+    }
+
+    nonisolated private static func kiroValue(_ database: OpaquePointer, table: String, key: String) throws -> Data? {
+        var statement: OpaquePointer?
+        defer { if let statement { sqlite3_finalize(statement) } }
+        // The table name is one of two constants; the key is bound.
+        guard sqlite3_prepare_v2(database, "SELECT value FROM \(table) WHERE key = ?1 LIMIT 1", -1, &statement, nil) == SQLITE_OK,
+              let statement else {
+            // A database from an older CLI may lack the table.
+            return nil
+        }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        guard sqlite3_bind_text(statement, 1, key, -1, transient) == SQLITE_OK else {
+            throw AIUsageError.credentialAccessDenied(.kiro)
+        }
+        let step = sqlite3_step(statement)
+        if step == SQLITE_DONE { return nil }
+        guard step == SQLITE_ROW else { throw AIUsageError.credentialAccessDenied(.kiro) }
+        let count = Int(sqlite3_column_bytes(statement, 0))
+        guard count > 0, count <= 1_048_576, let bytes = sqlite3_column_blob(statement, 0) else { return nil }
+        return Data(bytes: bytes, count: count)
+    }
+
+    /// AWS SSO access tokens are base64 segments joined by colons.
+    nonisolated private static func safeKiroToken(_ text: String) -> Bool {
+        let segments = text.split(separator: ":", omittingEmptySubsequences: false)
+        return segments.count <= 8 && segments.allSatisfy { safeToken(String($0)) }
+    }
+
+    nonisolated private static func safeArn(_ text: String) -> Bool {
+        text.hasPrefix("arn:aws") && text.utf8.count <= 256 && text.utf8.allSatisfy {
+            (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || ":/-_.".utf8.contains($0)
+        }
+    }
+
+    /// The region becomes part of the request host, so only plain region
+    /// names such as `us-east-1` are accepted.
+    nonisolated private static func safeRegion(_ text: String) -> Bool {
+        !text.isEmpty && text.utf8.count <= 32 && text.utf8.allSatisfy {
+            (97...122).contains($0) || (48...57).contains($0) || $0 == 45
+        } && text.first?.isLetter == true
+    }
+
+    /// Kiro CLI writes ISO 8601 dates with microseconds, which
+    /// `ISO8601DateFormatter` does not always accept.
+    nonisolated private static func flexibleDate(_ value: Any?) -> Date? {
+        if let date = epochDate(value) { return date }
+        guard let text = value as? String else { return nil }
+        if let date = isoDate(text) { return date }
+        let trimmed = text.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
+        return isoDate(trimmed)
+    }
+
     nonisolated private static func validateClaude(_ data: Data) throws -> (token: String, expiresAt: Date?) {
         guard let root = jsonObject(data),
               let oauth = root["claudeAiOauth"] as? [String: Any],
@@ -526,6 +705,9 @@ actor AIUsageService: AIUsageLoading {
                 }
             }
             let reset = isoDate(root["billingCycleEnd"])
+            let cycle = isoDate(root["billingCycleStart"]).flatMap { start in
+                reset.flatMap { $0 > start ? $0.timeIntervalSince(start) : nil }
+            }
             var details: [String] = []
             if boolean(plan["enabled"]) == false { details.append("Plan usage is disabled") }
             if let used { details.append("\(money(used)) used") }
@@ -539,15 +721,129 @@ actor AIUsageService: AIUsageLoading {
                 title: "Billing cycle",
                 usedPercent: total ?? derived,
                 resetsAt: reset,
-                detail: details.isEmpty ? nil : details.joined(separator: " · ")
+                detail: details.isEmpty ? nil : details.joined(separator: " · "),
+                duration: cycle
             ))
             for (key, title) in [("autoPercentUsed", "Auto"), ("apiPercentUsed", "API")] {
                 if let percent = nonnegative(plan[key]) {
-                    windows.append(AIUsageWindow(id: key, title: title, usedPercent: percent, resetsAt: reset, detail: nil))
+                    windows.append(AIUsageWindow(id: key, title: title, usedPercent: percent, resetsAt: reset, detail: nil, duration: cycle))
                 }
             }
         }
         return AIUsageSnapshot(plan: displayText(root["membershipType"]), windows: windows, fetchedAt: now)
+    }
+
+    /// Kiro bills in credits per monthly cycle. A free trial and bonus credits
+    /// are separate pools with their own expiry dates.
+    nonisolated private static func parseKiro(_ root: [String: Any], now: Date) -> AIUsageSnapshot {
+        let fallbackReset = epochDate(root["nextDateReset"])
+        let overage = root["overageConfiguration"] as? [String: Any]
+        let breakdowns = (root["usageBreakdownList"] as? [Any] ?? []).compactMap { $0 as? [String: Any] }
+        var windows: [AIUsageWindow] = []
+        for (index, item) in breakdowns.enumerated() {
+            let suffix = index == 0 ? "" : "_\(index)"
+            let plural = displayText(item["displayNamePlural"])
+                ?? displayText(item["displayName"]).map { "\($0)s" }
+                ?? "Credits"
+            let reset = epochDate(item["nextDateReset"]) ?? fallbackReset
+            var extra: [String] = []
+            if let over = kiroAmount(item, "currentOverages"), over > 0 {
+                extra.append("\(kiroNumber(over)) over the limit")
+            }
+            if let charges = nonnegative(item["overageCharges"]), charges > 0 {
+                extra.append("\(money(charges * 100)) overage charges")
+            }
+            if index == 0, displayText(overage?["overageStatus"]) == "ENABLED" {
+                extra.append("Overages enabled")
+            }
+            if let window = kiroWindow(
+                item,
+                id: "credits\(suffix)",
+                title: plural,
+                unit: plural.lowercased(),
+                resetsAt: reset,
+                duration: reset.flatMap(monthBefore),
+                extra: extra
+            ) {
+                windows.append(window)
+            }
+
+            if let trial = item["freeTrialInfo"] as? [String: Any],
+               displayText(trial["freeTrialStatus"]).map({ $0 == "ACTIVE" }) ?? true,
+               let window = kiroWindow(
+                   trial,
+                   id: "free_trial\(suffix)",
+                   title: "Free trial",
+                   unit: plural.lowercased(),
+                   resetsAt: epochDate(trial["freeTrialExpiry"]) ?? epochDate(trial["expiresAt"]),
+                   duration: nil,
+                   extra: []
+               ) {
+                windows.append(window)
+            }
+
+            let bonuses = (item["bonuses"] as? [Any] ?? []).compactMap { $0 as? [String: Any] }
+            for (bonusIndex, bonus) in bonuses.enumerated() {
+                if let status = displayText(bonus["status"]), status != "ACTIVE" { continue }
+                if let window = kiroWindow(
+                    bonus,
+                    id: "bonus\(suffix)_\(bonusIndex)",
+                    title: displayText(bonus["displayName"]) ?? "Bonus",
+                    unit: plural.lowercased(),
+                    resetsAt: epochDate(bonus["expiresAt"]) ?? epochDate(bonus["expiryDate"]),
+                    duration: nil,
+                    extra: []
+                ) {
+                    windows.append(window)
+                }
+            }
+        }
+        let subscription = root["subscriptionInfo"] as? [String: Any]
+        let plan = displayText(subscription?["subscriptionTitle"]).map { title in
+            // The API sends titles such as "KIRO POWER".
+            title == title.uppercased() ? title.capitalized : title
+        }
+        return AIUsageSnapshot(plan: plan, windows: windows, fetchedAt: now)
+    }
+
+    nonisolated private static func kiroWindow(
+        _ item: [String: Any],
+        id: String,
+        title: String,
+        unit: String,
+        resetsAt: Date?,
+        duration: TimeInterval?,
+        extra: [String]
+    ) -> AIUsageWindow? {
+        guard let limit = kiroAmount(item, "usageLimit"), limit > 0 else { return nil }
+        let used = kiroAmount(item, "currentUsage") ?? 0
+        let percent = used / limit * 100
+        return AIUsageWindow(
+            id: id,
+            title: title,
+            usedPercent: percent.isFinite ? percent : nil,
+            resetsAt: resetsAt,
+            detail: (["\(kiroNumber(used)) of \(kiroNumber(limit)) \(unit) used"] + extra).joined(separator: " · "),
+            duration: duration
+        )
+    }
+
+    /// Prefers the fractional value: credits are spent in fractions.
+    nonisolated private static func kiroAmount(_ item: [String: Any], _ key: String) -> Double? {
+        nonnegative(item["\(key)WithPrecision"]) ?? nonnegative(item[key])
+    }
+
+    nonisolated private static func kiroNumber(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(0...2)))
+    }
+
+    /// Kiro reports only the reset date. The cycle is the calendar month
+    /// before it, in UTC.
+    nonisolated private static func monthBefore(_ reset: Date) -> TimeInterval? {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
+        guard let start = calendar.date(byAdding: .month, value: -1, to: reset) else { return nil }
+        return reset.timeIntervalSince(start)
     }
 
     nonisolated private static func jsonObject(_ data: Data) -> [String: Any]? {

@@ -123,7 +123,7 @@ final class AIUsageModel {
     }
 
     private func synchronizeMenuBarOrder() {
-        let providerOrder: [AIUsageProvider: Int] = [.claude: 0, .codex: 1, .cursor: 2]
+        let providerOrder: [AIUsageProvider: Int] = [.claude: 0, .codex: 1, .cursor: 2, .kiro: 3]
         let standardOrder = states.enumerated().sorted { lhs, rhs in
             let lhsOrder = providerOrder[lhs.element.provider, default: .max]
             let rhsOrder = providerOrder[rhs.element.provider, default: .max]
@@ -131,9 +131,13 @@ final class AIUsageModel {
         }.map { $0.element.id }
         let available = Set(standardOrder)
         var seen = Set<String>()
-        menuBarAccountOrder = (menuBarAccountOrder + standardOrder).filter {
+        let order = (menuBarAccountOrder + standardOrder).filter {
             available.contains($0) && seen.insert($0).inserted
         }
+        // This runs on every auto refresh. Reassigning an unchanged order would
+        // still re-render the status item image.
+        guard order != menuBarAccountOrder else { return }
+        menuBarAccountOrder = order
         defaults.set(menuBarAccountOrder, forKey: "usage.menuBar.accountOrder")
     }
 
@@ -192,8 +196,10 @@ final class AIUsageModel {
         for profile in ClaudeAccountProfile.discover(home: home) where !hidden.contains(profile.id) {
             appendClaudeAccount(profile)
         }
-        if let name = defaults.string(forKey: "usage.claude.defaultName") {
-            claudeAccounts.first { $0.claudeProfile?.isDefault == true }?.claudeProfile?.name = name
+        if let name = defaults.string(forKey: "usage.claude.defaultName"),
+           let account = claudeAccounts.first(where: { $0.claudeProfile?.isDefault == true }),
+           account.claudeProfile?.name != name {
+            account.claudeProfile?.name = name
         }
         synchronizeMenuBarOrder()
         saveClaudeAccounts()
@@ -218,7 +224,8 @@ final class AIUsageModel {
 
     private func saveClaudeAccounts() {
         let profiles = claudeAccounts.compactMap(\.claudeProfile).filter { !$0.isDefault }
-        if let data = try? JSONEncoder().encode(profiles) {
+        if let data = try? JSONEncoder().encode(profiles),
+           data != defaults.data(forKey: "usage.claude.accounts") {
             defaults.set(data, forKey: "usage.claude.accounts")
         }
     }
@@ -268,10 +275,10 @@ final class AIUsageModel {
             let isInstalled = state.claudeProfile.map {
                 FileManager.default.fileExists(atPath: $0.configDirectory.path) || state.provider.isInstalled
             } ?? state.provider.isInstalled
-            state.isInstalled = isInstalled
+            if state.isInstalled != isInstalled { state.isInstalled = isInstalled }
 
             let key = "usage.enabled.\(state.id)"
-            if defaults.object(forKey: key) == nil {
+            if defaults.object(forKey: key) == nil, state.isEnabled != isInstalled {
                 state.isEnabled = isInstalled
             }
         }

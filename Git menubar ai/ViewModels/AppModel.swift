@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 
@@ -34,13 +35,33 @@ final class AppModel {
 
     let usage = AIUsageModel()
     let servers = RunningServersModel()
+    let tokens = TokenUsageModel()
+    let commitAI = CommitAISettingsModel()
+
+    /// The Settings screen covers whatever was showing; closing it returns there.
+    var isShowingSettings = false
+
+    /// Rescans the local Claude Code and Codex logs, including every Claude account.
+    func refreshTokenUsage(force: Bool = false) async {
+        let directories = usage.claudeAccounts.compactMap(\.claudeProfile?.configDirectory)
+        await tokens.refresh(claudeDirectories: directories, force: force)
+    }
 
     private let git = GitClient.shared
     private let store = RepositoryStore()
     private let generator = CommitMessageGenerator()
     private var watcher: FileSystemWatcher?
-    /// Debounce timers, one per repository.
-    private var refreshTasks: [UUID: Task<Void, Never>] = [:]
+    /// Pending file-event refreshes, one per repository.
+    @ObservationIgnored private var refreshTasks: [UUID: Task<Void, Never>] = [:]
+    /// When each repository last refreshed because of file events.
+    @ObservationIgnored private var lastFileEventRefresh: [UUID: ContinuousClock.Instant] = [:]
+    /// Pending write of the repository list.
+    @ObservationIgnored private var persistTask: Task<Void, Never>?
+
+    /// Lets a burst of writes land before reading status.
+    private static let fileEventSettleDelay: Duration = .milliseconds(500)
+    /// Upper bound on file-event refreshes per repository while files keep changing.
+    private static let minimumFileEventRefreshInterval: Duration = .seconds(3)
 
     init() {
         repositories = store.load().map { RepositoryState(repository: $0) }
@@ -88,7 +109,7 @@ final class AppModel {
     }
 
     var generatorEngineDescription: String {
-        generator.engineDescription
+        commitAI.engineDescription
     }
 
     // MARK: - Lifecycle
@@ -118,10 +139,28 @@ final class AppModel {
     }
 
     func refresh(_ state: RepositoryState) async {
-        loadProjectIconIfNeeded(for: state)
-        state.devServer = await DevServer.detect(in: state.repository.url)
+        // One refresh per repository at a time. A request that arrives while
+        // one is running becomes one more pass, because the running pass may
+        // have read status before the change it was asked about.
+        guard !state.isRefreshing else {
+            state.needsAnotherRefresh = true
+            return
+        }
         state.isRefreshing = true
         defer { state.isRefreshing = false }
+
+        repeat {
+            state.needsAnotherRefresh = false
+            await readStatus(of: state)
+        } while state.needsAnotherRefresh && repositories.contains(where: { $0 === state })
+    }
+
+    private func readStatus(of state: RepositoryState) async {
+        loadProjectIconIfNeeded(for: state)
+        let devServer = await DevServer.detect(in: state.repository.url)
+        // Assign only real changes. Every assignment to an observed property
+        // re-renders the views reading it, including the menu bar label.
+        if state.devServer != devServer { state.devServer = devServer }
 
         do {
             let status = try await git.status(at: state.repository.url)
@@ -134,8 +173,8 @@ final class AppModel {
             if let previous = state.status, previous != status {
                 recordActivity(for: state)
             }
-            state.status = status
-            state.loadFailure = nil
+            if state.status != status { state.status = status }
+            if state.loadFailure != nil { state.loadFailure = nil }
         } catch let failure as GitFailure {
             state.loadFailure = failure
         } catch {
@@ -155,15 +194,28 @@ final class AppModel {
         scheduleRefresh(for: state)
     }
 
-    /// Coalesces bursts of file system events into a single refresh.
+    /// Coalesces bursts of file system events into one refresh, and spaces
+    /// refreshes out while files keep changing (a build, an agent editing many
+    /// files, an editor rewriting the index). Each refresh starts several git
+    /// processes, so an unbounded rate shows up as CPU spikes.
     private func scheduleRefresh(for state: RepositoryState) {
-        refreshTasks[state.id]?.cancel()
+        // A refresh is already pending and will read these changes as well.
+        guard refreshTasks[state.id] == nil else { return }
+
+        let now = ContinuousClock.now
+        let earliest = lastFileEventRefresh[state.id].map { $0 + Self.minimumFileEventRefreshInterval } ?? now
+        let delay = max(Self.fileEventSettleDelay, earliest - now)
+
         refreshTasks[state.id] = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(500))
+            try? await Task.sleep(for: delay)
             guard !Task.isCancelled, let self else { return }
-            // Never refresh underneath a commit or push in flight.
+            refreshTasks[state.id] = nil
+            guard repositories.contains(where: { $0 === state }) else { return }
+            // Never refresh underneath a commit or push in flight. It refreshes
+            // itself when it finishes.
             guard !state.isBusy else { return }
-            await self.refresh(state)
+            lastFileEventRefresh[state.id] = .now
+            await refresh(state)
         }
     }
 
@@ -175,9 +227,21 @@ final class AppModel {
         store.save(repositories.map(\.repository))
     }
 
+    /// Activity is recorded on every file event, so batch the UserDefaults
+    /// writes instead of encoding and saving the whole list each time.
+    private func schedulePersist() {
+        guard persistTask == nil else { return }
+        persistTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard let self else { return }
+            persistTask = nil
+            persist()
+        }
+    }
+
     private func recordActivity(for state: RepositoryState, at date: Date = Date()) {
         guard repositories.contains(where: { $0 === state }), state.recordActivity(at: date) else { return }
-        persist()
+        schedulePersist()
     }
 
     private func loadProjectIconIfNeeded(for state: RepositoryState) {
@@ -188,7 +252,7 @@ final class AppModel {
         Task { @MainActor [weak self, weak state] in
             let data = await ProjectIconLoader.loadIconData(in: repositoryURL)
             guard let self, let state, repositories.contains(where: { $0 === state }) else { return }
-            state.projectIconData = data
+            state.projectIcon = data.flatMap(NSImage.init(data:))
         }
     }
 
@@ -229,6 +293,7 @@ final class AppModel {
     func remove(_ state: RepositoryState) {
         refreshTasks[state.id]?.cancel()
         refreshTasks[state.id] = nil
+        lastFileEventRefresh[state.id] = nil
         repositories.removeAll { $0.id == state.id }
         if selectedRepositoryID == state.id { selectedRepositoryID = nil }
         persist()
@@ -248,6 +313,7 @@ final class AppModel {
 
         state.isGeneratingMessage = true
         state.generationNote = nil
+        state.operationFailure = nil
         defer { state.isGeneratingMessage = false }
 
         let context: DiffContext
@@ -259,14 +325,26 @@ final class AppModel {
                 branch: status.branch,
                 changes: status.changes,
                 stats: [],
-                patchExcerpt: ""
+                patches: [:]
             )
         }
 
-        let generated = await generator.generate(for: context)
-        state.commitMessage = generated.message
-        recordActivity(for: state)
-
+        do {
+            let configuration = try await commitAI.configuration()
+            let generated = try await generator.generate(for: context, configuration: configuration)
+            state.commitMessage = generated.message
+            state.generationNote = generated.note
+            recordActivity(for: state)
+        } catch is CancellationError {
+            return
+        } catch {
+            // Keep whatever the user already typed; explain what went wrong.
+            state.operationFailure = GitFailure(
+                command: "Generate message",
+                exitCode: -1,
+                message: error.localizedDescription
+            )
+        }
     }
 
     // MARK: - Commit and push
@@ -459,6 +537,12 @@ final class AppModel {
     func openInCodex(_ state: RepositoryState) async {
         await handOff(state, named: "Open in Codex") {
             try await SystemIntegration.openInCodex(state.repository.url)
+        }
+    }
+
+    func openInKiro(_ state: RepositoryState) async {
+        await handOff(state, named: "Open in Kiro") {
+            try await SystemIntegration.openInKiro(state.repository.url)
         }
     }
 

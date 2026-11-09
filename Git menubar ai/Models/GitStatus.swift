@@ -189,8 +189,8 @@ nonisolated struct DiffContext: Sendable {
     var branch: String?
     var changes: [GitFileChange]
     var stats: [FileDiffStat]
-    /// A truncated unified diff, used only as extra signal for the on-device model.
-    var patchExcerpt: String
+    /// Each file's diff, or the start of a new file, keyed by repository-relative path.
+    var patches: [String: String]
 
     var totalInsertions: Int { stats.reduce(0) { $0 + $1.insertions } }
     var totalDeletions: Int { stats.reduce(0) { $0 + $1.deletions } }

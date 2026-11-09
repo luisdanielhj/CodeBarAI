@@ -99,15 +99,16 @@ private struct ProviderLimitSummary: Identifiable {
     let title: String
     let logoName: String
     let accountNumber: Int?
-    /// The session limit, or Auto for Cursor.
+    /// The session limit, or Auto for Cursor, or credits for Kiro.
     let top: Limit
-    /// The weekly limit, or API for Cursor.
-    let bottom: Limit
+    /// The weekly limit, or API for Cursor. Kiro has a second pool only
+    /// during a free trial or bonus, so its row is omitted otherwise.
+    let bottom: Limit?
 
     init(state: AIUsageState, accountNumber: Int?) {
         let windows = state.snapshot?.windows ?? []
         let top: (id: String, title: String)
-        let bottom: (id: String, title: String)
+        let bottom: (id: String, title: String)?
         switch state.provider {
         case .claude:
             top = ("five_hour", "Session")
@@ -119,6 +120,10 @@ private struct ProviderLimitSummary: Identifiable {
             // Cursor reports no session or weekly limits, only per-cycle pools.
             top = ("autoPercentUsed", "Auto")
             bottom = ("apiPercentUsed", "API")
+        case .kiro:
+            top = ("credits", "Credits")
+            bottom = windows.first { $0.id == "free_trial" || $0.id.hasPrefix("bonus_") }
+                .map { ($0.id, $0.title) }
         }
 
         id = state.id
@@ -126,7 +131,9 @@ private struct ProviderLimitSummary: Identifiable {
         logoName = state.provider.logoName
         self.accountNumber = accountNumber
         self.top = Self.limit(windows.first { $0.id == top.id }, fallbackTitle: top.title)
-        self.bottom = Self.limit(windows.first { $0.id == bottom.id }, fallbackTitle: bottom.title)
+        self.bottom = bottom.map { bottom in
+            Self.limit(windows.first { $0.id == bottom.id }, fallbackTitle: bottom.title)
+        }
     }
 
     private static func limit(_ window: AIUsageWindow?, fallbackTitle: String) -> Limit {
@@ -137,7 +144,7 @@ private struct ProviderLimitSummary: Identifiable {
     }
 
     var accessibilityDescription: String {
-        let limits = [top, bottom].map { limit in
+        let limits = ([top] + (bottom.map { [$0] } ?? [])).map { limit in
             guard let left = limit.percentLeft else { return "\(limit.title) usage unavailable" }
             return "\(limit.title) \(left) percent left"
         }
@@ -158,7 +165,9 @@ private struct UsageStatusStrip: View {
 
                     VStack(alignment: .trailing, spacing: 0) {
                         percentage(summary.top)
-                        percentage(summary.bottom)
+                        if let bottom = summary.bottom {
+                            percentage(bottom)
+                        }
                     }
                     .font(.system(size: 10, weight: .semibold))
                     .monospacedDigit()

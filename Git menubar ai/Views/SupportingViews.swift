@@ -61,190 +61,79 @@ extension View {
     }
 }
 
-/// Compact artwork loaded from a repository's `.ico` file.
-struct RepositoryIconView: View {
-    let data: Data?
-    var size: CGFloat = 18
+extension EnvironmentValues {
+    /// Whether the menu bar window is on screen. Polling views use it to stop
+    /// working while the window is closed.
+    @Entry var isMenuWindowVisible = false
+}
 
-    @ViewBuilder
-    var body: some View {
-        if let data, let image = NSImage(data: data) {
-            Image(nsImage: image)
-                .resizable()
-                .interpolation(.high)
-                .scaledToFit()
-                .frame(width: size, height: size)
-                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-        }
+/// `MenuBarExtra` hides its window instead of closing it, so `onDisappear` never
+/// fires and a view's `.task` keeps running after the menu closes. This reads
+/// the hosting window's real visibility from AppKit instead.
+private struct WindowVisibilityReader: NSViewRepresentable {
+    let onChange: (Bool) -> Void
+
+    func makeNSView(context: Context) -> WindowVisibilityView {
+        let view = WindowVisibilityView()
+        view.onChange = onChange
+        return view
+    }
+
+    func updateNSView(_ nsView: WindowVisibilityView, context: Context) {
+        nsView.onChange = onChange
     }
 }
 
-/// A borderless row that highlights on hover, the way list rows behave in
-/// Spotlight-style panels.
-struct HoverRow<Content: View>: View {
-    private let action: () -> Void
-    private let content: Content
-    @State private var isHovering = false
+private final class WindowVisibilityView: NSView {
+    var onChange: ((Bool) -> Void)?
+    private var observers: [NSObjectProtocol] = []
+    private var lastReported: Bool?
 
-    init(action: @escaping () -> Void, @ViewBuilder content: () -> Content) {
-        self.action = action
-        self.content = content()
-    }
-
-    var body: some View {
-        Button(action: action) {
-            content
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(isHovering ? Color.primary.opacity(0.07) : Color.clear)
-                )
-                .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers = []
+        guard let window else {
+            report(false)
+            return
         }
-        .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
-    }
-}
 
-/// A compact icon-only toolbar button for the header.
-struct HeaderButton: View {
-    let systemImage: String
-    let help: String
-    let action: () -> Void
-    @State private var isHovering = false
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.system(size: 12, weight: .medium))
-                .frame(width: 22, height: 22)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(isHovering ? Color.primary.opacity(0.1) : Color.clear)
-                )
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(.secondary)
-        .onHover { isHovering = $0 }
-        .help(help)
-    }
-}
-
-/// A small rounded label used for branch names and counts.
-struct Chip: View {
-    let text: String
-    var systemImage: String?
-    var tint: Color = .secondary
-
-    var body: some View {
-        HStack(spacing: 3) {
-            if let systemImage {
-                Image(systemName: systemImage)
-                    .font(.system(size: 9, weight: .semibold))
-            }
-            Text(text)
-                .font(.system(size: 10, weight: .medium))
-                .lineLimit(1)
-        }
-        .foregroundStyle(tint)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-        .background(
-            Capsule(style: .continuous)
-                .fill(tint.opacity(0.12))
-        )
-    }
-}
-
-/// Severity of an inline message.
-enum BannerKind {
-    case error
-    case warning
-    case success
-    case info
-
-    var tint: Color {
-        switch self {
-        case .error: return .red
-        case .warning: return .orange
-        case .success: return .green
-        case .info: return .secondary
-        }
-    }
-
-    var symbolName: String {
-        switch self {
-        case .error: return "exclamationmark.octagon.fill"
-        case .warning: return "exclamationmark.triangle.fill"
-        case .success: return "checkmark.circle.fill"
-        case .info: return "info.circle.fill"
-        }
-    }
-}
-
-/// Inline message card. Used instead of alerts, which would dismiss the menu bar window.
-struct InlineBanner: View {
-    let kind: BannerKind
-    let title: String
-    var detail: String?
-    var hint: String?
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 7) {
-            Image(systemName: kind.symbolName)
-                .font(.system(size: 11))
-                .foregroundStyle(kind.tint)
-                .padding(.top, 1)
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.primary)
-
-                if let detail, !detail.isEmpty {
-                    Text(detail)
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .lineLimit(6)
-                }
-
-                if let hint, !hint.isEmpty {
-                    Text(hint)
-                        .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(kind.tint)
-                        .lineLimit(4)
+        let names: [Notification.Name] = [
+            NSWindow.didChangeOcclusionStateNotification,
+            NSWindow.didBecomeKeyNotification,
+            NSWindow.didResignKeyNotification,
+            NSWindow.willCloseNotification
+        ]
+        observers = names.map { name in
+            NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    // AppKit updates `isVisible` and the occlusion state after
+                    // these notifications are posted, so read them next pass.
+                    DispatchQueue.main.async { self?.evaluate() }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(8)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(kind.tint.opacity(0.1))
-        )
+        evaluate()
+    }
+
+    private func evaluate() {
+        guard let window else {
+            report(false)
+            return
+        }
+        report(window.isVisible && (window.isKeyWindow || window.occlusionState.contains(.visible)))
+    }
+
+    private func report(_ isVisible: Bool) {
+        guard isVisible != lastReported else { return }
+        lastReported = isVisible
+        onChange?(isVisible)
     }
 }
 
-/// Uppercase section label.
-struct SectionLabel: View {
-    let text: String
-    var trailing: String?
-
-    var body: some View {
-        HStack {
-            Text(text.uppercased())
-                .font(.system(size: 9.5, weight: .semibold))
-                .foregroundStyle(.tertiary)
-                .kerning(0.4)
-            Spacer()
-            if let trailing {
-                Text(trailing)
-                    .font(.system(size: 9.5, weight: .medium))
-                    .foregroundStyle(.tertiary)
-            }
-        }
+extension View {
+    /// Calls `action` when the hosting window appears on or leaves the screen.
+    func onWindowVisibilityChange(_ action: @escaping (Bool) -> Void) -> some View {
+        background { WindowVisibilityReader(onChange: action) }
     }
 }

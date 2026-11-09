@@ -40,11 +40,15 @@ nonisolated enum ProcessRunner {
         attributes: .concurrent
     )
 
+    /// - Parameter standardInput: Bytes written to the command's stdin, which is
+    ///   then closed. Use it for secrets so they never appear in `ps` output.
+    ///   Without it, stdin is `/dev/null`.
     static func run(
         executableURL: URL,
         arguments: [String],
         workingDirectory: URL? = nil,
         environment: [String: String]? = nil,
+        standardInput: Data? = nil,
         timeout: TimeInterval = 30
     ) async throws -> ProcessOutput {
         try await withCheckedThrowingContinuation { continuation in
@@ -55,6 +59,7 @@ nonisolated enum ProcessRunner {
                         arguments: arguments,
                         workingDirectory: workingDirectory,
                         environment: environment,
+                        standardInput: standardInput,
                         timeout: timeout
                     )
                     continuation.resume(returning: output)
@@ -70,6 +75,7 @@ nonisolated enum ProcessRunner {
         arguments: [String],
         workingDirectory: URL?,
         environment: [String: String]?,
+        standardInput: Data?,
         timeout: TimeInterval
     ) throws -> ProcessOutput {
         let process = Process()
@@ -83,12 +89,20 @@ nonisolated enum ProcessRunner {
         process.standardOutput = outputPipe
         process.standardError = errorPipe
         // Never let a command (or a git hook) block waiting on input.
-        process.standardInput = FileHandle.nullDevice
+        let inputPipe = standardInput.map { _ in Pipe() }
+        process.standardInput = inputPipe ?? FileHandle.nullDevice
 
         do {
             try process.run()
         } catch {
             throw ProcessRunnerError.launchFailed(error.localizedDescription)
+        }
+
+        // Input is small (a key, a password), far below the pipe buffer, so
+        // writing it before draining the output pipes cannot deadlock.
+        if let inputPipe, let standardInput {
+            try? inputPipe.fileHandleForWriting.write(contentsOf: standardInput)
+            try? inputPipe.fileHandleForWriting.close()
         }
 
         // Drain both pipes concurrently: a large diff would otherwise fill the

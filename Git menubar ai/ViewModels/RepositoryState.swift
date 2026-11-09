@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// Observable per-repository state: the last status snapshot plus the in-progress
@@ -11,8 +12,12 @@ final class RepositoryState: Identifiable {
     /// Set when reading status failed, e.g. the folder was moved or deleted.
     var loadFailure: GitFailure?
     var isRefreshing = false
-    /// Small project artwork discovered from an `.ico` file in the repository.
-    var projectIconData: Data?
+    /// Set when a change arrives while a refresh is already reading status, so
+    /// that refresh runs once more instead of a second one starting alongside it.
+    @ObservationIgnored var needsAnotherRefresh = false
+    /// Small project artwork discovered from an `.ico` file in the repository,
+    /// decoded once so list rows do not decode it on every render.
+    var projectIcon: NSImage?
     var didSearchForProjectIcon = false
     /// How to start this repository's Node server, or `nil` when it has none.
     var devServer: DevServer?

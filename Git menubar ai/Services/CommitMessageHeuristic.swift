@@ -159,12 +159,15 @@ nonisolated enum CommitMessageHeuristic {
 
     // MARK: - Formatting
 
-    /// Trims to a length limit on a word boundary.
+    /// Trims to a length limit on a word boundary, without leaving dangling punctuation.
     static func truncate(_ text: String, to limit: Int) -> String {
         guard text.count > limit else { return text }
-        let clipped = String(text.prefix(limit))
+        var clipped = String(text.prefix(limit))
         if let lastSpace = clipped.lastIndex(of: " "), clipped.distance(from: clipped.startIndex, to: lastSpace) > limit / 2 {
-            return String(clipped[..<lastSpace])
+            clipped = String(clipped[..<lastSpace])
+        }
+        while let last = clipped.last, ",;:-– ".contains(last) {
+            clipped.removeLast()
         }
         return clipped
     }

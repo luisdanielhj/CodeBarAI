@@ -53,6 +53,11 @@ nonisolated enum SensitiveFileScanner {
         }
     }
 
+    /// Why the file at a repository-relative path looks like a secret, or `nil`.
+    static func reason(forPath path: String) -> String? {
+        reason(forFileNamed: (path as NSString).lastPathComponent)
+    }
+
     private static func reason(forFileNamed fileName: String) -> String? {
         let lowercased = fileName.lowercased()
 

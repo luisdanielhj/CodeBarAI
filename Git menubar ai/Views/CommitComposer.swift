@@ -1,31 +1,63 @@
 import SwiftUI
 
-/// The editable commit message plus the Commit & Push / Commit actions.
+/// The commit message editor plus Commit & Push and Commit.
 struct CommitComposer: View {
     @Environment(AppModel.self) private var model
     @Bindable var state: RepositoryState
+    @FocusState private var editorFocused: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 6) {
-                SectionLabel(text: "Commit message")
-                Spacer()
-                generateButton
+        VStack(alignment: .leading, spacing: 8) {
+            SectionHeader(title: "Message") {
+                HStack(spacing: 2) {
+                    generateButton
+                    IconButton(systemImage: "gearshape", help: "Choose the AI that writes commit messages") {
+                        withAnimation(.snappy(duration: 0.2)) { model.isShowingSettings = true }
+                    }
+                }
             }
+            .padding(.leading, 2)
 
             messageEditor
 
             if let note = state.generationNote {
                 Text(note)
-                    .font(.system(size: 10))
+                    .font(.system(size: 10.5))
                     .foregroundStyle(.tertiary)
                     .lineLimit(2)
+                    .padding(.leading, 2)
             }
 
-            actions
+            HStack(spacing: 6) {
+                WideButton(
+                    title: state.activity ?? "Commit & Push",
+                    systemImage: "arrow.up",
+                    style: .primary,
+                    isWorking: state.isBusy
+                ) {
+                    Task { await model.commit(state, push: true) }
+                }
+                .disabled(!state.canPush)
+                .keyboardShortcut(.return, modifiers: .command)
+                .help("Commit all changes and push (⌘↩)")
+
+                WideButton(title: "Commit") {
+                    Task { await model.commit(state, push: false) }
+                }
+                .frame(width: 92)
+                .disabled(!state.canCommit)
+                .keyboardShortcut(.return, modifiers: [.command, .shift])
+                .help("Commit without pushing (⇧⌘↩)")
+            }
+
+            if let reason = disabledReason {
+                Text(reason)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.tertiary)
+                    .padding(.leading, 2)
+            }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(Theme.edge)
     }
 
     // MARK: Generate
@@ -38,19 +70,24 @@ struct CommitComposer: View {
                 if state.isGeneratingMessage {
                     ProgressView()
                         .controlSize(.small)
-                        .scaleEffect(0.55)
-                        .frame(width: 9, height: 9)
+                        .scaleEffect(0.5)
+                        .frame(width: 10, height: 10)
                 } else {
                     Image(systemName: "sparkles")
-                        .font(.system(size: 9.5))
+                        .font(.system(size: 9.5, weight: .semibold))
                 }
-                Text(state.isGeneratingMessage ? "Generating…" : "Generate")
-                    .font(.system(size: 10.5, weight: .medium))
+                Text(state.isGeneratingMessage ? "Writing…" : "Generate")
+                    .font(.system(size: 11, weight: .medium))
             }
+            .foregroundStyle(canGenerate ? Color.accentColor : Color.secondary)
+            .padding(.horizontal, 8)
+            .frame(height: 20)
+            .background(Color.accentColor.opacity(canGenerate ? 0.1 : 0.0), in: Capsule())
+            .contentShape(Capsule())
         }
-        .controlSize(.small)
+        .buttonStyle(.plain)
         .disabled(!canGenerate)
-        .help("Write a Conventional Commit message from the current changes — \(model.generatorEngineDescription)")
+        .help("Write a Conventional Commit message from the current changes with \(model.generatorEngineDescription)")
     }
 
     private var canGenerate: Bool {
@@ -65,83 +102,35 @@ struct CommitComposer: View {
             TextEditor(text: $state.commitMessage)
                 .font(.system(size: 12))
                 .scrollContentBackground(.hidden)
+                .focused($editorFocused)
                 .padding(.horizontal, 5)
-                .padding(.vertical, 5)
-                .frame(height: 54)
+                .padding(.vertical, 6)
+                .frame(height: 84)
 
             if state.commitMessage.isEmpty {
-                Text("feat(scope): describe the change")
+                Text("Describe the change, or press Generate")
                     .font(.system(size: 12))
                     .foregroundStyle(.tertiary)
                     .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
+                    .padding(.vertical, 6)
                     .allowsHitTesting(false)
             }
         }
-        .background(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(Color.primary.opacity(0.05))
-        )
+        .card()
         .overlay(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.09))
+            RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous)
+                .strokeBorder(Color.accentColor.opacity(editorFocused ? 0.5 : 0), lineWidth: 1)
         )
-    }
-
-    // MARK: Actions
-
-    private var actions: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 8) {
-                Button {
-                    Task { await model.commit(state, push: true) }
-                } label: {
-                    HStack(spacing: 5) {
-                        if state.isBusy {
-                            ProgressView()
-                                .controlSize(.small)
-                                .scaleEffect(0.55)
-                                .frame(width: 9, height: 9)
-                        } else {
-                            Image(systemName: "arrow.up.circle.fill")
-                                .font(.system(size: 11))
-                        }
-                        Text(state.activity ?? "Commit & Push")
-                            .font(.system(size: 12, weight: .medium))
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!state.canPush)
-                .keyboardShortcut(.return, modifiers: .command)
-
-                Button("Commit") {
-                    Task { await model.commit(state, push: false) }
-                }
-                .font(.system(size: 12))
-                .disabled(!state.canCommit)
-                .keyboardShortcut(.return, modifiers: [.command, .shift])
-                .help("Commit without pushing (⇧⌘↩)")
-            }
-
-            if let reason = disabledReason {
-                Text(reason)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-            }
-        }
+        .animation(.easeOut(duration: 0.15), value: editorFocused)
     }
 
     /// Explains a disabled Commit & Push button so the UI is never silently inert.
     private var disabledReason: String? {
-        guard !state.isBusy else { return nil }
-        guard let status = state.status else { return nil }
-
+        guard !state.isBusy, let status = state.status else { return nil }
         if let blocker = status.commitBlocker {
             if case .nothingToCommit = blocker { return nil }
             return blocker.message
         }
-
         return nil
     }
 }

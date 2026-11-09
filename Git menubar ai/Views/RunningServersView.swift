@@ -1,70 +1,46 @@
 import AppKit
 import SwiftUI
 
-struct RunningServersView: View {
+/// Local development servers, with quick open and stop.
+struct ServersView: View {
     let model: RunningServersModel
     let projects: [Repository]
-    @State private var contentHeight: CGFloat = 48
+    let maxHeight: CGFloat
+    @Environment(\.isMenuWindowVisible) private var isMenuWindowVisible
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 6) {
-                Text("Running Servers")
-                    .font(.system(size: 10, weight: .semibold))
-                if !model.servers.isEmpty {
-                    Text("\(model.servers.count)")
-                        .font(.system(size: 9))
-                        .monospacedDigit()
+        FittedScrollView(maxHeight: maxHeight, estimatedHeight: 160) {
+            VStack(spacing: 2) {
+                if let failure = model.failure {
+                    InlineBanner(kind: .warning, title: failure)
+                        .padding(.horizontal, 6)
+                        .padding(.bottom, 4)
                 }
-                Spacer()
-                if model.isRefreshing {
-                    ProgressView().controlSize(.mini)
-                } else {
-                    Button {
-                        Task { await model.refresh(projects: projects) }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 10))
-                            .frame(width: 20, height: 16)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Refresh running servers")
-                    .accessibilityLabel("Refresh running servers")
-                }
-            }
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 5)
-
-            ScrollView {
-                VStack(spacing: 6) {
-                    if let failure = model.failure {
-                        Text(failure)
-                            .foregroundStyle(.orange)
-                            .font(.system(size: 10))
-                            .fixedSize(horizontal: false, vertical: true)
-                            .padding(10)
-                    }
-                    if model.servers.isEmpty && model.failure == nil {
-                        Text(model.hasLoaded ? "No development servers running." : "Looking for local development servers…")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(10)
+                if model.servers.isEmpty && model.failure == nil {
+                    if model.hasLoaded {
+                        EmptyState(
+                            systemImage: "network.slash",
+                            title: "No servers running",
+                            message: "Dev servers you start from your projects appear here."
+                        )
                     } else {
-                        ForEach(model.servers) { server in
-                            serverRow(server)
-                        }
+                        ProgressView()
+                            .controlSize(.small)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 36)
+                    }
+                } else {
+                    ForEach(model.servers) { server in
+                        ServerRow(model: model, server: server)
                     }
                 }
-                .padding(6)
-                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
-                .syncScrollerAppearance()
             }
-            .frame(height: min(contentHeight, 160))
+            .padding(6)
         }
-        .padding(.vertical, 4)
-        .task {
+        .task(id: isMenuWindowVisible) {
+            // Scanning every process is the most expensive poll in the app, so
+            // it only runs while someone can see the result.
+            guard isMenuWindowVisible else { return }
             await model.refresh(projects: projects)
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
@@ -76,36 +52,60 @@ struct RunningServersView: View {
             Task { await model.refresh(projects: projects) }
         }
     }
+}
 
-    private func serverRow(_ server: RunningServer) -> some View {
+private struct ServerRow: View {
+    let model: RunningServersModel
+    let server: RunningServer
+    @State private var isHovering = false
+
+    private var needsForce: Bool { model.needsForceStop.contains(server.id) }
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 8) {
-                Image(systemName: "network")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.green)
-                VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(.green)
+                    .frame(width: 7, height: 7)
+                    .shadow(color: .green.opacity(0.6), radius: 3)
+                    .frame(width: 26)
+
+                VStack(alignment: .leading, spacing: 1) {
                     Text(server.title)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.system(size: 12.5, weight: .medium))
                         .lineLimit(1)
                     Text("\(server.runtime) · \(server.portDescription)")
-                        .font(.system(size: 10))
+                        .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
+                        .monospacedDigit()
                         .lineLimit(1)
                 }
-                .help("\(server.runtime) · PID \(server.process.pid)\n\(server.workingDirectory ?? server.process.executable)\n\(server.portDescription)")
-                Spacer(minLength: 0)
-                if model.stopping.contains(server.id) {
-                    ProgressView().controlSize(.mini)
-                } else {
-                    Button(model.needsForceStop.contains(server.id) ? "Force Stop" : "Stop") {
-                        Task { await model.stop(server, force: model.needsForceStop.contains(server.id)) }
+                .help("\(server.runtime) · PID \(server.process.pid)\n\(server.workingDirectory ?? server.process.executable)")
+
+                Spacer(minLength: 4)
+
+                if let port = server.ports.first, let url = server.localURL(port: port) {
+                    IconButton(systemImage: "arrow.up.right", help: "Open localhost:\(port)") {
+                        NSWorkspace.shared.open(url)
                     }
-                    .font(.system(size: 10, weight: .medium))
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.red)
-                    .accessibilityLabel("\(model.needsForceStop.contains(server.id) ? "Force stop" : "Stop") \(server.title) on \(server.portDescription)")
                 }
-                Menu {
+
+                if model.stopping.contains(server.id) {
+                    InlineSpinner()
+                } else {
+                    Button(needsForce ? "Force Stop" : "Stop") {
+                        Task { await model.stop(server, force: needsForce) }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 9)
+                    .frame(height: 22)
+                    .background(Color.red.opacity(isHovering ? 0.14 : 0.09), in: Capsule())
+                    .accessibilityLabel("\(needsForce ? "Force stop" : "Stop") \(server.title) on \(server.portDescription)")
+                }
+
+                IconMenu(help: "Server options") {
                     ForEach(server.ports, id: \.self) { port in
                         Button("Open localhost:\(port)") {
                             if let url = server.localURL(port: port) { NSWorkspace.shared.open(url) }
@@ -117,23 +117,22 @@ struct RunningServersView: View {
                             NSWorkspace.shared.open(URL(fileURLWithPath: directory, isDirectory: true))
                         }
                     }
-                } label: {
-                    Image(systemName: "ellipsis").font(.system(size: 11))
                 }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .help("Server options")
             }
             if let error = model.stopFailures[server.id] {
                 Text(error)
-                    .font(.system(size: 10))
+                    .font(.system(size: 10.5))
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 36)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.rowRadius, style: .continuous)
+                .fill(isHovering ? Theme.hoverFill : .clear)
+        )
+        .onHover { isHovering = $0 }
     }
 }

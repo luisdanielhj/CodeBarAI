@@ -85,6 +85,7 @@ nonisolated struct ClaudeAccountsTests {
         let defaults = UserDefaults(suiteName: suite)!
         defaults.set(false, forKey: "usage.enabled.cursor")
         defaults.set(false, forKey: "usage.enabled.codex")
+        defaults.set(false, forKey: "usage.enabled.kiro")
         return (defaults, suite)
     }
 
@@ -154,17 +155,19 @@ nonisolated struct ClaudeAccountsTests {
         let second = model.claudeAccounts[1]
         let codex = model.states.first { $0.provider == .codex }!
         let cursor = model.states.first { $0.provider == .cursor }!
-        expect(model.menuBarStates.map(\.id) == [second.id, codex.id, cursor.id], "Upgrade must keep the previously displayed Claude account and provider order")
+        let kiro = model.states.first { $0.provider == .kiro }!
+        expect(model.menuBarStates.map(\.id) == [second.id, codex.id, cursor.id, kiro.id], "Upgrade must keep the previously displayed Claude account and provider order")
         model.setMenuBarVisibility(original, isVisible: true)
         expect(model.menuBarStates.filter { $0.provider == .claude }.count == 2, "Multiple Claude accounts can be displayed together")
         model.setMenuBarVisibility(cursor, isVisible: false)
+        model.setMenuBarVisibility(kiro, isVisible: false)
         model.moveMenuBarAccount(second, by: -1)
         model.moveMenuBarAccount(codex, by: -1)
         model.moveMenuBarAccount(codex, by: -1)
         let expectedOrder = [codex.id, second.id, original.id]
         expect(model.menuBarStates.map(\.id) == expectedOrder, "The menu bar must honor account order across providers")
         model.moveMenuBarAccount(codex, by: -1)
-        model.moveMenuBarAccount(cursor, by: 1)
+        model.moveMenuBarAccount(kiro, by: 1)
         expect(model.menuBarStates.map(\.id) == expectedOrder, "Boundary moves must leave the order intact")
         model.renameClaudeAccount(second, to: "Work Account")
         await model.connect(original)
@@ -199,7 +202,7 @@ nonisolated struct ClaudeAccountsTests {
         defaults.set(["cursor", "missing", "claude", "cursor"], forKey: "usage.menuBar.accountOrder")
         defaults.set(["missing", "claude"], forKey: "usage.menuBar.visibleAccounts")
         let repaired = AIUsageModel(defaults: defaults, service: service, home: home, environment: [:])
-        expect(repaired.menuBarAccountOrder == ["cursor", "claude", second.id, "codex"], "Ignore stale and duplicate saved entries while keeping the user's order")
+        expect(repaired.menuBarAccountOrder == ["cursor", "claude", second.id, "codex", "kiro"], "Ignore stale and duplicate saved entries while keeping the user's order")
         expect(repaired.menuBarStates.map(\.id) == ["claude"], "Discard only unavailable accounts from a saved selection")
     }
 

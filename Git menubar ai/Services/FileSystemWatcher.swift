@@ -80,12 +80,18 @@ nonisolated final class FileSystemWatcher: @unchecked Sendable {
         guard !snapshot.isEmpty else { return }
 
         var changed: Set<String> = []
-        for path in paths where Self.isRelevant(path) {
+        for path in paths {
             // Longest match wins, so a repository nested inside another is attributed correctly.
-            let match = snapshot
-                .filter { path == $0 || path.hasPrefix($0 + "/") }
-                .max(by: { $0.count < $1.count })
-            if let match { changed.insert(match) }
+            guard let root = snapshot
+                .filter({ path == $0 || path.hasPrefix($0 + "/") })
+                .max(by: { $0.count < $1.count }),
+                !changed.contains(root)
+            else { continue }
+            // Judge only the part inside the repository, so a repository that
+            // itself lives under a folder named e.g. `build` is still watched.
+            if Self.isRelevant(relativePath: path.dropFirst(root.count)) {
+                changed.insert(root)
+            }
         }
 
         for root in changed {
@@ -93,21 +99,38 @@ nonisolated final class FileSystemWatcher: @unchecked Sendable {
         }
     }
 
-    /// Filters out the constant churn inside `.git` while keeping the few files
-    /// that mean the branch, index or merge state actually moved.
-    private static func isRelevant(_ path: String) -> Bool {
-        if path.hasSuffix(".lock") { return false }
+    /// Dependency, build and cache folders that are gitignored in practically
+    /// every project. Dev servers, bundlers and package managers write to them
+    /// constantly, and each write would otherwise trigger a full `git status`.
+    /// A tracked change inside one of them is still picked up when the window
+    /// opens or by the periodic refresh.
+    private static let generatedDirectories: Set<Substring> = [
+        "node_modules", ".next", ".nuxt", ".svelte-kit", ".turbo", ".vercel",
+        ".parcel-cache", ".vite", ".cache", ".expo", ".angular", ".astro",
+        "dist", "build", ".build", "DerivedData", "Pods", "target",
+        ".gradle", ".venv", "venv", "__pycache__", ".pytest_cache",
+        ".mypy_cache", ".ruff_cache", ".tox", "coverage", ".nyc_output",
+        ".terraform", ".idea", "xcuserdata"
+    ]
 
-        guard let range = path.range(of: "/.git/") else {
-            return true
+    private static let interestingGitFiles: Set<String> = [
+        "HEAD", "index", "ORIG_HEAD", "MERGE_HEAD",
+        "CHERRY_PICK_HEAD", "REVERT_HEAD", "packed-refs"
+    ]
+
+    /// Filters out the constant churn inside `.git` and generated folders while
+    /// keeping the few `.git` files that mean the branch, index or merge state
+    /// actually moved. `relativePath` starts after the repository root.
+    private static func isRelevant(relativePath: Substring) -> Bool {
+        if relativePath.hasSuffix(".lock") || relativePath.hasSuffix("/.DS_Store") { return false }
+
+        let components = relativePath.split(separator: "/")
+        guard let gitIndex = components.firstIndex(of: ".git") else {
+            return !components.contains(where: generatedDirectories.contains)
         }
 
-        let suffix = String(path[range.upperBound...])
-        let interesting: Set<String> = [
-            "HEAD", "index", "ORIG_HEAD", "MERGE_HEAD",
-            "CHERRY_PICK_HEAD", "REVERT_HEAD", "packed-refs"
-        ]
-        if interesting.contains(suffix) { return true }
+        let suffix = components[(gitIndex + 1)...].joined(separator: "/")
+        if interestingGitFiles.contains(suffix) { return true }
         return suffix.hasPrefix("refs/") || suffix.hasPrefix("rebase-")
     }
 }

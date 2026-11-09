@@ -126,6 +126,21 @@ enum SystemIntegration {
         )
     }
 
+    /// Opens a new terminal window in the repository and starts Kiro CLI's
+    /// interactive session there.
+    static func openInKiro(_ url: URL) async throws {
+        let directories = try await resolve(
+            tool: "kiro-cli",
+            hint: "Install Kiro CLI, then try again."
+        )
+        try await runInTerminal(
+            "kiro-cli",
+            at: url,
+            windowTitle: "Kiro — \(url.lastPathComponent)",
+            pathAdditions: directories
+        )
+    }
+
     /// Assign inside the interactive command, after shell startup files run,
     /// so an alias or .zshrc cannot silently choose another account. The empty
     /// secure-storage override preserves the default account's unscoped entry.

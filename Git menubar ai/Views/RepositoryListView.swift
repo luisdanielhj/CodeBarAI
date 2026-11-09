@@ -1,287 +1,192 @@
 import SwiftUI
 
-/// Five recent projects by default, with access to the full repository list.
-struct RepositoryListView: View {
+/// Recent projects first. Five are shown until the list is expanded.
+struct ProjectsView: View {
     @Environment(AppModel.self) private var model
-    @State private var showingAllRepositories = false
-    @State private var contentHeight: CGFloat = 500
+    @AppStorage("ui.showAllProjects") private var showingAll = false
+    let maxHeight: CGFloat
 
     private let recentLimit = 5
 
     private var visibleRepositories: [RepositoryState] {
         let recent = model.displayedRepositories
-        return showingAllRepositories ? recent : Array(recent.prefix(recentLimit))
+        return showingAll ? recent : Array(recent.prefix(recentLimit))
     }
 
     var body: some View {
-        ScrollView {
-            content
-                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
-                .syncScrollerAppearance()
+        FittedScrollView(maxHeight: maxHeight, estimatedHeight: 260) {
+            VStack(spacing: 6) {
+                banners
+
+                if model.repositories.isEmpty {
+                    EmptyState(
+                        systemImage: "folder.badge.plus",
+                        title: "No projects yet",
+                        message: "Add a Git repository to see its changes and commit from the menu bar."
+                    ) {
+                        WideButton(title: "Add Repository…", systemImage: "plus", style: .primary) {
+                            Task { await model.addRepository() }
+                        }
+                        .frame(width: 170)
+                    }
+                } else {
+                    VStack(spacing: 1) {
+                        ForEach(visibleRepositories) { state in
+                            ProjectRow(state: state) {
+                                withAnimation(.snappy(duration: 0.2)) {
+                                    model.selectedRepositoryID = state.id
+                                }
+                            }
+                            .contextMenu { ProjectContextMenu(state: state) }
+                        }
+                    }
+
+                    if model.repositories.count > recentLimit {
+                        Button {
+                            withAnimation(.snappy(duration: 0.2)) { showingAll.toggle() }
+                        } label: {
+                            Text(showingAll ? "Show recent only" : "Show all \(model.repositories.count)")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 24)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(6)
         }
-        .frame(height: min(contentHeight, max(300, (NSScreen.main?.visibleFrame.height ?? 800) - 32)))
     }
 
-    private var content: some View {
-        VStack(spacing: 0) {
-            header
-
-            Divider().opacity(0.5)
-
+    @ViewBuilder
+    private var banners: some View {
+        Group {
             if let gitFailure = model.gitFailure {
-                InlineBanner(
-                    kind: .error,
-                    title: "Git is not available",
-                    detail: gitFailure
-                )
-                .padding(10)
+                InlineBanner(kind: .error, title: "Git is not available", detail: gitFailure)
             }
-
             if let addFailure = model.addFailure {
-                InlineBanner(kind: .warning, title: "Could not add repository", detail: addFailure)
-                    .padding(.horizontal, 10)
-                    .padding(.top, 10)
+                InlineBanner(kind: .warning, title: "Could not add repository", detail: addFailure) {
+                    model.addFailure = nil
+                }
             }
-
             if let actionFailure = model.actionFailure {
                 InlineBanner(
                     kind: .error,
                     title: actionFailure.title,
                     detail: actionFailure.message,
                     hint: actionFailure.hint
-                )
-                .padding(.horizontal, 10)
-                .padding(.top, 10)
-            }
-
-            if model.repositories.isEmpty {
-                emptyState
-            } else {
-                repositoryList
-            }
-
-            Divider().opacity(0.5)
-            AIUsageView(model: model.usage)
-            Divider().opacity(0.5)
-            RunningServersView(model: model.servers, projects: model.repositories.map(\.repository))
-            Divider().opacity(0.5)
-            footer
-        }
-    }
-
-    private var header: some View {
-        HStack(spacing: 6) {
-            Text("CodeBarAI")
-                .font(.system(size: 13, weight: .semibold))
-
-            if model.totalChangedFileCount > 0 {
-                Chip(text: "\(model.totalChangedFileCount) changed", tint: .orange)
-            }
-
-            Spacer()
-
-            HeaderButton(systemImage: "arrow.clockwise", help: "Refresh all repositories") {
-                Task { await model.refreshAll() }
-            }
-            HeaderButton(systemImage: "plus", help: "Add a repository") {
-                Task { await model.addRepository() }
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-    }
-
-    @ViewBuilder
-    private var repositoryList: some View {
-        ScrollView {
-            VStack(spacing: 1) {
-                ForEach(visibleRepositories) { state in
-                    RepositoryRow(state: state) {
-                        model.selectedRepositoryID = state.id
-                    }
-                    .contextMenu {
-                        Button("Open in Cursor") { Task { await model.openInCursor(state) } }
-                        if model.usage.claudeAccounts.count > 1 {
-                            Menu("Open in Claude Code") {
-                                ClaudeAccountLaunchOptions(repository: state)
-                            }
-                        } else {
-                            Button("Open in Claude Code") { Task { await model.openInClaudeCode(state) } }
-                        }
-                        Button("Open in Codex") { Task { await model.openInCodex(state) } }
-                        if let server = state.devServer {
-                            Divider()
-                            Button("Start Server (\(server.title))") {
-                                Task { await model.startDevServer(state) }
-                            }
-                        }
-                        Divider()
-                        Button("Open in Finder") { model.openInFinder(state) }
-                        Button("Open in Terminal") { Task { await model.openInTerminal(state) } }
-                        Divider()
-                        Button("Remove from List") { model.remove(state) }
-                    }
+                ) {
+                    model.actionFailure = nil
                 }
             }
-            .padding(6)
-            .syncScrollerAppearance()
         }
-        // A ScrollView has no useful ideal height inside a MenuBarExtra window,
-        // so AppKit can collapse it to zero even though its rows exist. Reserve
-        // one row of height per visible repository; expand into a scrolling list.
-        .frame(height: min(CGFloat(visibleRepositories.count) * 44 + 12, 400))
-
-        if model.repositories.count > recentLimit {
-            Button {
-                showingAllRepositories.toggle()
-            } label: {
-                HStack(spacing: 4) {
-                    Text(showingAllRepositories ? "View less" : "View more (\(model.repositories.count - recentLimit))")
-                    Image(systemName: showingAllRepositories ? "chevron.up" : "chevron.down")
-                }
-                .font(.system(size: 10, weight: .medium))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(Color.accentColor)
-            .padding(.bottom, 4)
-        }
-    }
-
-    private var emptyState: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "folder.badge.plus")
-                .font(.system(size: 24, weight: .light))
-                .foregroundStyle(.tertiary)
-
-            Text("No repositories yet")
-                .font(.system(size: 12, weight: .medium))
-
-            Text("Add a local Git repository to commit and push without leaving the menu bar.")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Button("Add Repository…") {
-                Task { await model.addRepository() }
-            }
-            .controlSize(.small)
-            .padding(.top, 2)
-        }
-        .padding(.horizontal, 28)
-        .padding(.vertical, 28)
-        .frame(maxWidth: .infinity)
-    }
-
-    private var footer: some View {
-        HStack {
-            Text("Built by UpskyAI")
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
-
-            Spacer()
-
-            Button("Quit") {
-                NSApplication.shared.terminate(nil)
-            }
-            .buttonStyle(.plain)
-            .font(.system(size: 10))
-            .foregroundStyle(.secondary)
-            .keyboardShortcut("q")
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 6)
     }
 }
 
-/// One repository in the list: name, branch, and how many files changed.
-struct RepositoryRow: View {
+/// Right-click actions for a project row.
+private struct ProjectContextMenu: View {
+    @Environment(AppModel.self) private var model
+    let state: RepositoryState
+
+    var body: some View {
+        Button("Open in Cursor") { Task { await model.openInCursor(state) } }
+        if model.usage.claudeAccounts.count > 1 {
+            Menu("Open in Claude Code") {
+                ClaudeAccountLaunchOptions(repository: state)
+            }
+        } else {
+            Button("Open in Claude Code") { Task { await model.openInClaudeCode(state) } }
+        }
+        Button("Open in Codex") { Task { await model.openInCodex(state) } }
+        Button("Open in Kiro") { Task { await model.openInKiro(state) } }
+        if let server = state.devServer {
+            Divider()
+            Button("Start Server (\(server.title))") {
+                Task { await model.startDevServer(state) }
+            }
+        }
+        Divider()
+        Button("Show in Finder") { model.openInFinder(state) }
+        Button("Open in Terminal") { Task { await model.openInTerminal(state) } }
+        Divider()
+        Button("Remove from List", role: .destructive) { model.remove(state) }
+    }
+}
+
+/// One project: artwork, name, branch, and how many files changed.
+struct ProjectRow: View {
     let state: RepositoryState
     let action: () -> Void
 
     var body: some View {
-        HoverRow(action: action) {
-            HStack(spacing: 9) {
-                statusIndicator
+        HoverRow(action: action) { isHovering in
+            HStack(spacing: 10) {
+                ProjectIcon(image: state.projectIcon, name: state.repository.name, size: 26)
 
-                RepositoryIconView(data: state.projectIconData, size: 20)
-
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 1) {
                     Text(state.repository.name)
                         .font(.system(size: 12.5, weight: .medium))
                         .lineLimit(1)
-
-                    HStack(spacing: 5) {
-                        if state.loadFailure != nil {
-                            Label("Unavailable", systemImage: "exclamationmark.triangle.fill")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.red)
-                        } else if let status = state.status {
-                            Label(status.branchDisplayName, systemImage: "arrow.triangle.branch")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-
-                            if let divergence = status.divergenceSummary {
-                                Text(divergence)
-                                    .font(.system(size: 10, weight: .medium))
-                                    .foregroundStyle(.secondary)
-                            }
-                        } else {
-                            Text("Loading…")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
+                    subtitle
+                        .font(.system(size: 10.5))
+                        .lineLimit(1)
                 }
 
-                Spacer(minLength: 4)
+                Spacer(minLength: 6)
 
-                trailingDetail
+                trailing
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .opacity(isHovering ? 1 : 0)
             }
         }
-    }
-
-    /// Dot showing at a glance whether the repository has uncommitted work.
-    private var statusIndicator: some View {
-        Circle()
-            .fill(indicatorColor)
-            .frame(width: 7, height: 7)
-    }
-
-    private var indicatorColor: Color {
-        if state.loadFailure != nil { return .red }
-        guard let status = state.status else { return .secondary.opacity(0.4) }
-        if !status.conflicts.isEmpty { return .red }
-        if !status.isClean { return .orange }
-        return .green.opacity(0.7)
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("Shows changes and the commit composer")
     }
 
     @ViewBuilder
-    private var trailingDetail: some View {
-        HStack(spacing: 6) {
-            if state.isRefreshing {
-                ProgressView()
-                    .controlSize(.small)
-                    .scaleEffect(0.6)
-                    .frame(width: 10, height: 10)
-            } else if let status = state.status {
-                if !status.conflicts.isEmpty {
-                    Chip(text: "\(status.conflicts.count) conflict", systemImage: "exclamationmark.triangle.fill", tint: .red)
-                } else if status.changedFileCount > 0 {
-                    Chip(text: "\(status.changedFileCount)", tint: .orange)
-                } else {
-                    Text("Clean")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
+    private var subtitle: some View {
+        if state.loadFailure != nil {
+            Text("Unavailable")
+                .foregroundStyle(.red)
+        } else if let status = state.status {
+            HStack(spacing: 5) {
+                Text(status.branchDisplayName)
+                if let divergence = status.divergenceSummary {
+                    Text(divergence).monospacedDigit()
+                }
+                if let operation = status.operationInProgress {
+                    Text("· \(operation) in progress")
+                        .foregroundStyle(.orange)
                 }
             }
-
-            Image(systemName: "chevron.right")
-                .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(.secondary)
+        } else {
+            Text("Loading…")
                 .foregroundStyle(.tertiary)
+        }
+    }
+
+    @ViewBuilder
+    private var trailing: some View {
+        if let status = state.status {
+            if !status.conflicts.isEmpty {
+                Chip(text: "\(status.conflicts.count)", systemImage: "exclamationmark.triangle.fill", tint: .red)
+                    .help("\(status.conflicts.count) conflicted files")
+            } else if status.changedFileCount > 0 {
+                Chip(text: "\(status.changedFileCount)", tint: .orange)
+                    .help("\(status.changedFileCount) changed files")
+            }
+        } else if state.isRefreshing {
+            // Only before the first status. Later refreshes stay silent so the
+            // list does not flicker on every file change.
+            ProgressView()
+                .controlSize(.mini)
         }
     }
 }

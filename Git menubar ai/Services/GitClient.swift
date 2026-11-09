@@ -159,9 +159,11 @@ nonisolated struct GitClient: Sendable {
 
     // MARK: - Diff context for message generation
 
+    /// Collects each changed file's diff, plus the start of every new file,
+    /// which `git diff HEAD` doesn't show until the file is staged.
     func diffContext(at url: URL, status: GitStatus) async throws -> DiffContext {
         var stats: [FileDiffStat] = []
-        var patch = ""
+        var patches: [String: String] = [:]
 
         if status.hasCommits {
             let numstat = try? await runChecked(
@@ -172,21 +174,132 @@ nonisolated struct GitClient: Sendable {
             )
             if let numstat { stats = Self.parseNumstat(numstat) }
 
+            // Fixed prefixes, so a user's diff.noprefix or mnemonicPrefix
+            // setting can't break the per-file split.
             let raw = try? await runChecked(
-                ["-c", "core.quotepath=false", "diff", "--no-color", "--unified=1", "HEAD"],
+                [
+                    "-c", "core.quotepath=false",
+                    "diff", "--no-color", "--no-ext-diff", "--unified=3",
+                    "--src-prefix=a/", "--dst-prefix=b/", "HEAD"
+                ],
                 label: "git diff",
                 in: url,
                 timeout: Self.statusTimeout
             )
-            if let raw { patch = String(raw.prefix(6000)) }
+            if let raw { patches = Self.splitPatch(raw) }
+        }
+
+        let newFiles = status.changes.filter { change in
+            patches[change.path] == nil
+                && (change.kind == .untracked || change.kind == .added)
+                && SensitiveFileScanner.reason(forPath: change.path) == nil
+        }
+        if !newFiles.isEmpty {
+            let excerpts = await Task.detached(priority: .userInitiated) {
+                newFiles.compactMap { change in
+                    Self.newFileExcerpt(at: url.appending(path: change.path)).map { (change.path, $0) }
+                }
+            }.value
+            for (path, excerpt) in excerpts {
+                patches[path] = excerpt.text
+                if !stats.contains(where: { $0.path == path }) {
+                    stats.append(FileDiffStat(path: path, insertions: excerpt.lineCount, deletions: 0))
+                }
+            }
         }
 
         return DiffContext(
             branch: status.branch,
             changes: status.changes,
             stats: stats,
-            patchExcerpt: patch
+            patches: patches
         )
+    }
+
+    /// Splits a unified diff into one entry per file, keyed by the file's
+    /// current path. Git's own header lines are dropped to save space; the
+    /// lines that say what happened to the file (new, deleted, renamed,
+    /// binary) are kept.
+    static func splitPatch(_ raw: String) -> [String: String] {
+        var patches: [String: String] = [:]
+        var section: [Substring] = []
+
+        func flush() {
+            guard let header = section.first else { return }
+            var path: String?
+            var body: [Substring] = []
+            var inHunks = false
+            for line in section.dropFirst() {
+                if line.hasPrefix("@@") { inHunks = true }
+                if inHunks {
+                    body.append(line)
+                    continue
+                }
+                if line.hasPrefix("rename to ") {
+                    path = String(line.dropFirst("rename to ".count))
+                } else if line.hasPrefix("+++ b/") {
+                    path = path ?? String(line.dropFirst("+++ b/".count))
+                } else if line.hasPrefix("--- a/"), path == nil {
+                    // A deletion has `+++ /dev/null`; its old path is the key.
+                    path = String(line.dropFirst("--- a/".count))
+                }
+                if line.hasPrefix("new file") || line.hasPrefix("deleted file")
+                    || line.hasPrefix("rename ") || line.hasPrefix("Binary files")
+                    || line.hasPrefix("old mode") || line.hasPrefix("new mode") {
+                    body.append(line)
+                }
+            }
+            // Git ends `---`/`+++` paths that contain spaces with a tab.
+            let resolved = path.map { $0.hasSuffix("\t") ? String($0.dropLast()) : $0 }
+                ?? symmetricPath(inHeader: header)
+            if let resolved {
+                patches[resolved] = body.joined(separator: "\n")
+            }
+        }
+
+        for line in raw.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("diff --git ") {
+                flush()
+                section = [line]
+            } else if !section.isEmpty {
+                section.append(line)
+            }
+        }
+        flush()
+        return patches
+    }
+
+    /// `diff --git a/<path> b/<path>` for a file whose path didn't change,
+    /// used when the patch has no `+++` line (a binary or mode-only change).
+    private static func symmetricPath(inHeader header: Substring) -> String? {
+        let rest = header.dropFirst("diff --git a/".count)
+        guard rest.count > 3, (rest.count - 3) % 2 == 0 else { return nil }
+        let path = rest.prefix((rest.count - 3) / 2)
+        guard rest.dropFirst(path.count) == " b/" + path else { return nil }
+        return String(path)
+    }
+
+    /// The start of a file git isn't tracking yet, formatted like added diff
+    /// lines. `nil` when the file can't be read.
+    nonisolated static func newFileExcerpt(
+        at url: URL,
+        byteLimit: Int = 48_000
+    ) -> (text: String, lineCount: Int)? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: byteLimit + 1) else { return nil }
+        if data.isEmpty { return ("new file (empty)", 0) }
+        if data.prefix(8_000).contains(0) { return ("new file (binary)", 0) }
+
+        var text = String(decoding: data.prefix(byteLimit), as: UTF8.self)
+        let isComplete = data.count <= byteLimit
+        if !isComplete, let lastNewline = text.lastIndex(of: "\n") {
+            text = String(text[..<lastNewline])
+        }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        var body = "new file\n" + lines.map { "+" + $0 }.joined(separator: "\n")
+        if !isComplete { body += "\n[rest of the file not read]" }
+        return (body, lines.count)
     }
 
     // MARK: - Write operations

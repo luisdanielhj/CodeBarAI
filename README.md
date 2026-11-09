@@ -1,6 +1,6 @@
 # CodeBarAI
 
-A macOS menu bar app for developers who work with AI coding tools. It shows how much of your **Claude Code**, **Codex** and **Cursor** limits you have left, keeps an eye on your local Git repositories, and lets you commit and push without leaving the menu bar. It can also write the commit message for you with Apple's on-device model.
+A macOS menu bar app for developers who work with AI coding tools. It shows how much of your **Claude Code**, **Codex**, **Cursor** and **Kiro CLI** limits you have left, keeps an eye on your local Git repositories, and lets you commit and push without leaving the menu bar. It can also write the commit message for you with Apple's on-device model.
 
 <p align="center">
   <img src="Git menubar ai/Assets.xcassets/AppIcon.appiconset/app-icon-256.png" width="128" alt="CodeBarAI icon">
@@ -13,10 +13,11 @@ A macOS menu bar app for developers who work with AI coding tools. It shows how 
   - **Claude Code**: 5-hour session and 7-day weekly limits (plus the Sonnet and Opus weekly limits in the detail view)
   - **Codex**: primary (session) and secondary (weekly) windows
   - **Cursor**: Auto and API usage for the current billing cycle, plus the amount spent against your limit
+  - **Kiro CLI**: monthly credits used against your plan, plus free-trial and bonus credits when you have them
 - Finds installed tools on its own and refreshes usage in the background. It backs off after errors and follows `Retry-After` when a provider rate-limits it.
 - Connect or disconnect each provider separately.
 - **Multiple Claude accounts**: discovers account folders such as `~/.claude-work` and `~/.claude-account-2`, with separate usage, refresh times, and connect/disconnect controls. Add other config folders with **Add Claude Account…** and rename them from their **⋯** menus.
-- **Organize Menu Bar…** lets you check any combination of accounts and use the arrows to set their order, including Claude, Codex, and Cursor. Visibility and order are saved between launches. Multiple Claude accounts use small numbered badges inside their logos; hover to see their full names. Numbers stay with their accounts when you reorder or hide them.
+- **Organize Menu Bar…** lets you check any combination of accounts and use the arrows to set their order, including Claude, Codex, Cursor, and Kiro CLI. Visibility and order are saved between launches. Multiple Claude accounts use small numbered badges inside their logos; hover to see their full names. Numbers stay with their accounts when you reorder or hide them.
 - If no installed account is selected for display, the status item shows how many files have changed across your repositories.
 
 ### Git from the menu bar
@@ -52,7 +53,7 @@ A macOS menu bar app for developers who work with AI coding tools. It shows how 
 - macOS 27 or later
 - Xcode 27 or later (to build)
 - Git, either at `/usr/bin/git` (Xcode Command Line Tools) or from Homebrew
-- Optional: Claude Code, Codex and/or Cursor, signed in with a subscription
+- Optional: Claude Code, Codex, Cursor and/or Kiro CLI, signed in with a subscription
 - Optional: Apple Intelligence turned on, for on-device commit messages
 
 ## Building from source
@@ -117,14 +118,16 @@ The usage numbers come from your own subscription accounts, using the sign-in da
 | Claude Code | Each account's `.credentials.json`, then its own Keychain entry (`Claude Code-credentials` for the default login, or a directory-specific entry for a custom config folder) | `api.anthropic.com/api/oauth/usage` |
 | Codex       | `~/.codex/auth.json` (or `$CODEX_HOME`), then Keychain `Codex Auth`                   | `chatgpt.com/backend-api/wham/usage`         |
 | Cursor      | Cursor's local `state.vscdb` (read-only)                                              | `cursor.com/api/usage-summary`               |
+| Kiro CLI    | Kiro CLI's local `~/Library/Application Support/kiro-cli/data.sqlite3` (read-only)    | `q.<region>.amazonaws.com/getUsageLimits`    |
 
+- Kiro CLI's access token expires after about an hour. When it has expired, CodeBarAI runs `kiro-cli whoami` (at most once every 10 minutes) so the CLI renews and saves its own token. CodeBarAI never refreshes or writes Kiro's credentials itself.
 - Each token is sent **only** to its own provider's usage endpoint. CodeBarAI never saves, logs or forwards it anywhere else.
 - Requests use an ephemeral `URLSession` with no cookies and no cache. **Redirects are refused**, so a token can't be sent on to another host.
 - A provider's credentials are only read when that provider is enabled. You can disconnect any provider from the usage view.
 - Your repository list, Claude account folder paths and labels, and menu bar account visibility and order are kept in `UserDefaults`. Tokens are held only in memory. There is no analytics or telemetry.
 - Running-server discovery reads local process and socket metadata. Server command arguments and environment values are never displayed, logged, persisted, or sent anywhere.
 
-> **Note:** These usage endpoints are not public, documented APIs. Providers can change them without notice, and a provider may then show "unsupported usage response" until the app is updated. CodeBarAI is not affiliated with Anthropic, OpenAI or Cursor.
+> **Note:** These usage endpoints are not public, documented APIs. Providers can change them without notice, and a provider may then show "unsupported usage response" until the app is updated. CodeBarAI is not affiliated with Anthropic, OpenAI, Cursor or Amazon.
 
 ## Project structure
 

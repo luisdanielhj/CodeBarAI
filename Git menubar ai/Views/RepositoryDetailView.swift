@@ -1,36 +1,40 @@
 import AppKit
 import SwiftUI
 
-/// One repository in detail: branch state, changed files, and the commit composer.
+/// One project: where it stands, what changed, and the commit composer.
 struct RepositoryDetailView: View {
     @Environment(AppModel.self) private var model
     let state: RepositoryState
+    let maxHeight: CGFloat
 
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider().opacity(0.5)
 
-            VStack(spacing: 9) {
-                branchSummary
+            VStack(alignment: .leading, spacing: 10) {
+                OpenInRow(state: state)
                 notices
             }
-            .padding(.horizontal, 12)
-            .padding(.top, 10)
-            .padding(.bottom, 2)
+            .padding(.horizontal, Theme.edge)
+            .padding(.bottom, 10)
 
-            ChangedFilesSection(state: state)
+            ChangedFilesSection(state: state, maxHeight: max(120, maxHeight - 326))
 
             Divider().opacity(0.5)
+
             CommitComposer(state: state)
-
-            Divider().opacity(0.5)
-            footer
         }
         .overlay {
             if let pending = model.pendingCommit, pending.repositoryID == state.id {
                 SensitiveFileWarning(pending: pending)
             }
+        }
+        .task(id: state.lastSuccess) {
+            // Success needs no action, so it clears itself.
+            guard state.lastSuccess != nil else { return }
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled else { return }
+            withAnimation { state.lastSuccess = nil }
         }
     }
 
@@ -38,67 +42,77 @@ struct RepositoryDetailView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            HeaderButton(systemImage: "chevron.left", help: "Back to all repositories") {
-                model.selectedRepositoryID = nil
+            IconButton(systemImage: "chevron.left", help: "All projects") {
+                withAnimation(.snappy(duration: 0.2)) { model.selectedRepositoryID = nil }
             }
 
-            RepositoryIconView(data: state.projectIconData, size: 22)
+            ProjectIcon(image: state.projectIcon, name: state.repository.name, size: 26)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(state.repository.name)
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
-                Text(state.repository.displayPath)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
+                    .help(state.repository.displayPath)
+                branchLine
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
-                    .truncationMode(.head)
             }
 
             Spacer(minLength: 4)
 
             if state.isRefreshing {
-                ProgressView()
-                    .controlSize(.small)
-                    .scaleEffect(0.65)
-                    .frame(width: 16, height: 16)
+                InlineSpinner()
             } else {
-                HeaderButton(systemImage: "arrow.clockwise", help: "Refresh") {
+                IconButton(systemImage: "arrow.clockwise", help: "Refresh") {
                     Task { await model.refresh(state) }
                 }
             }
+
+            IconMenu(help: "More actions") {
+                Button("Show in Finder") { model.openInFinder(state) }
+                Button("Open in Terminal") { Task { await model.openInTerminal(state) } }
+                if model.usage.claudeAccounts.count > 1 {
+                    Menu("Open in Claude Code") {
+                        ClaudeAccountLaunchOptions(repository: state)
+                    }
+                }
+                if let server = state.devServer {
+                    Divider()
+                    Button("Start Server (\(server.title))") {
+                        Task { await model.startDevServer(state) }
+                    }
+                }
+                Divider()
+                Button("Remove from List", role: .destructive) { model.remove(state) }
+            }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 9)
+        .padding(.leading, 6)
+        .padding(.trailing, 8)
+        .padding(.vertical, 10)
     }
 
-    // MARK: Branch
-
     @ViewBuilder
-    private var branchSummary: some View {
+    private var branchLine: some View {
         if let status = state.status {
-            HStack(spacing: 6) {
+            HStack(spacing: 4) {
                 Image(systemName: "arrow.triangle.branch")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-
+                    .font(.system(size: 9, weight: .semibold))
                 Text(status.branchDisplayName)
-                    .font(.system(size: 12, weight: .medium))
-                    .lineLimit(1)
-
                 if let upstream = status.upstream {
-                    Chip(text: upstream, tint: .secondary)
+                    Text("→ \(upstream)")
+                        .foregroundStyle(.tertiary)
                 }
                 if let divergence = status.divergenceSummary {
-                    Chip(text: divergence, tint: .blue)
-                }
-
-                Spacer(minLength: 4)
-
-                if let operation = status.operationInProgress {
-                    Chip(text: operation, systemImage: "exclamationmark.triangle.fill", tint: .orange)
+                    Text(divergence)
+                        .monospacedDigit()
+                        .foregroundStyle(.blue)
                 }
             }
+            .help(state.repository.displayPath)
+        } else {
+            Text(state.repository.displayPath)
+                .truncationMode(.head)
         }
     }
 
@@ -107,92 +121,120 @@ struct RepositoryDetailView: View {
     @ViewBuilder
     private var notices: some View {
         if let failure = state.loadFailure {
-            InlineBanner(
-                kind: .error,
-                title: failure.title,
-                detail: failure.message,
-                hint: failure.hint
-            )
+            InlineBanner(kind: .error, title: failure.title, detail: failure.message, hint: failure.hint)
         }
 
         if let failure = state.operationFailure {
-            InlineBanner(
-                kind: .error,
-                title: failure.title,
-                detail: failure.message,
-                hint: failure.hint
-            )
+            InlineBanner(kind: .error, title: failure.title, detail: failure.message, hint: failure.hint) {
+                state.operationFailure = nil
+            }
         }
 
         if let success = state.lastSuccess {
             InlineBanner(kind: .success, title: success)
+                .transition(.opacity)
         }
 
-        if let status = state.status, let blocker = status.pushBlocker, !status.isClean {
-            VStack(alignment: .leading, spacing: 7) {
-                InlineBanner(kind: .warning, title: "Push is blocked", detail: blocker.message)
+        if let operation = state.status?.operationInProgress {
+            InlineBanner(kind: .warning, title: "\(operation) is in progress",
+                         detail: "Finish or abort it in a terminal before committing.")
+        }
 
-                if case .noUpstream(let branch, let canPublish) = blocker, canPublish {
-                    Button {
+        if let status = state.status, !status.isClean, let blocker = status.pushBlocker {
+            switch blocker {
+            case .noUpstream(let branch, true):
+                HStack(spacing: 8) {
+                    Image(systemName: "icloud.and.arrow.up")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Text("“\(branch)” isn’t on the remote yet.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    Spacer(minLength: 4)
+                    Button("Publish") {
                         Task { await model.publishBranch(for: state) }
-                    } label: {
-                        Label("Publish “\(branch)”", systemImage: "arrow.up.circle")
                     }
-                    .controlSize(.small)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 9)
+                    .frame(height: 22)
+                    .background(Color.primary.opacity(0.08), in: Capsule())
                     .disabled(state.isBusy)
                 }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .card()
+            case .operationInProgress:
+                // Already explained by the banner above.
+                EmptyView()
+            default:
+                InlineBanner(kind: .warning, title: "Push is blocked", detail: blocker.message)
             }
         }
-    }
-
-    // MARK: Footer
-
-    private var footer: some View {
-        HStack(spacing: 12) {
-            FooterButton(title: "Cursor", assetImage: "CursorLogo") {
-                Task { await model.openInCursor(state) }
-            }
-            if model.usage.claudeAccounts.count > 1 {
-                Menu {
-                    ClaudeAccountLaunchOptions(repository: state)
-                } label: {
-                    Label {
-                        Text("Claude Code")
-                    } icon: {
-                        Image("ClaudeLogo")
-                            .renderingMode(.template)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: 11, height: 11)
-                    }
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(.secondary)
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help("Choose a Claude account")
-            } else {
-                FooterButton(title: "Claude Code", assetImage: "ClaudeLogo") {
-                    Task { await model.openInClaudeCode(state) }
-                }
-            }
-            FooterButton(title: "Codex", assetImage: "CodexLogo") {
-                Task { await model.openInCodex(state) }
-            }
-
-            Spacer()
-
-            FooterButton(title: "Remove", systemImage: "trash", tint: .red) {
-                model.remove(state)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
     }
 }
 
-/// Shared by the repository context menu and the detail footer, so choosing
-/// an account always launches that profile without changing any other login.
+/// Open the project in one of the coding tools.
+private struct OpenInRow: View {
+    @Environment(AppModel.self) private var model
+    let state: RepositoryState
+
+    var body: some View {
+        HStack(spacing: 6) {
+            OpenInButton(title: "Cursor", logo: "CursorLogo") {
+                Task { await model.openInCursor(state) }
+            }
+            OpenInButton(title: "Claude", logo: "ClaudeLogo") {
+                Task { await model.openInClaudeCode(state) }
+            }
+            .help(model.usage.claudeAccounts.count > 1
+                  ? "Opens with \(model.usage.selectedClaudeAccount?.claudeProfile?.name ?? "the selected") account. Choose another from the ⋯ menu."
+                  : "Open in Claude Code")
+            OpenInButton(title: "Codex", logo: "CodexLogo") {
+                Task { await model.openInCodex(state) }
+            }
+            OpenInButton(title: "Kiro", logo: "KiroLogo") {
+                Task { await model.openInKiro(state) }
+            }
+            .help("Open in Kiro CLI")
+        }
+    }
+}
+
+private struct OpenInButton: View {
+    let title: String
+    let logo: String
+    let action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(logo)
+                    .renderingMode(.template)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 12, height: 12)
+                Text(title)
+                    .font(.system(size: 11.5, weight: .medium))
+            }
+            .foregroundStyle(isHovering ? .primary : .secondary)
+            .frame(maxWidth: .infinity)
+            .frame(height: 28)
+            .background(
+                Color.primary.opacity(isHovering ? 0.09 : 0.05),
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+    }
+}
+
+/// Shared by the project context menu and the detail menu, so choosing an
+/// account always launches that profile without changing any other login.
 struct ClaudeAccountLaunchOptions: View {
     @Environment(AppModel.self) private var model
     let repository: RepositoryState
@@ -206,115 +248,81 @@ struct ClaudeAccountLaunchOptions: View {
     }
 }
 
-/// Text-and-icon button used in the detail footer.
-struct FooterButton: View {
-    let title: String
-    var systemImage: String?
-    var assetImage: String?
-    var tint: Color = .secondary
-    let action: () -> Void
-    @State private var isHovering = false
-
-    var body: some View {
-        Button(action: action) {
-            Label {
-                Text(title)
-            } icon: {
-                if let assetImage {
-                    Image(assetImage)
-                        .renderingMode(.template)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(width: 11, height: 11)
-                } else if let systemImage {
-                    Image(systemName: systemImage)
-                }
-            }
-                .font(.system(size: 10.5, weight: .medium))
-                .foregroundStyle(isHovering ? tint.opacity(0.9) : tint)
-        }
-        .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
-    }
-}
-
-/// The scrollable list of changed files.
+/// The changed files. Clicking one opens it in Cursor.
 struct ChangedFilesSection: View {
     @Environment(AppModel.self) private var model
     let state: RepositoryState
+    let maxHeight: CGFloat
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            SectionLabel(text: "Changed files", trailing: countLabel)
-                .padding(.horizontal, 12)
-                .padding(.top, 8)
+        VStack(alignment: .leading, spacing: 4) {
+            SectionHeader(title: "Changes") {
+                if let count = state.status?.changedFileCount, count > 0 {
+                    Text("\(count)")
+                        .font(.system(size: 11, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, Theme.edge + 2)
 
             if let status = state.status {
                 if status.changes.isEmpty {
-                    Text("Working tree is clean.")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.tertiary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle")
+                            .foregroundStyle(.green)
+                        Text("Nothing to commit")
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.system(size: 11.5))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 22)
                 } else {
-                    ScrollView {
-                        LazyVStack(spacing: 1) {
+                    FittedScrollView(maxHeight: maxHeight, estimatedHeight: CGFloat(min(status.changes.count, 6)) * 26) {
+                        LazyVStack(spacing: 0) {
                             ForEach(status.changes) { change in
-                                ChangedFileRow(
-                                    change: change
-                                ) {
+                                ChangedFileRow(change: change) {
                                     Task { await model.openInCursor(change, in: state) }
                                 }
                             }
                         }
                         .padding(.horizontal, 6)
                         .padding(.bottom, 6)
-                        .syncScrollerAppearance()
                     }
-                    .frame(height: rowsHeight(for: status.changes.count))
                 }
             } else {
                 Text("Reading status…")
-                    .font(.system(size: 11))
+                    .font(.system(size: 11.5))
                     .foregroundStyle(.tertiary)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 22)
             }
         }
     }
-
-    private var countLabel: String? {
-        guard let count = state.status?.changedFileCount, count > 0 else { return nil }
-        return "\(count)"
-    }
-
-    /// Grows with the change count up to a cap, so small change sets don't leave a gap.
-    private func rowsHeight(for count: Int) -> CGFloat {
-        let rowHeight: CGFloat = 29
-        return min(CGFloat(count) * rowHeight + 6, 190)
-    }
 }
 
-/// A single changed file. Clicking opens it in Cursor.
+/// A single changed file with a one-letter status badge.
 struct ChangedFileRow: View {
     let change: GitFileChange
     let action: () -> Void
 
     var body: some View {
-        HoverRow(action: action) {
-            HStack(spacing: 7) {
-                Image(systemName: change.kind.symbolName)
-                    .font(.system(size: 10.5))
+        HoverRow(action: action) { isHovering in
+            HStack(spacing: 8) {
+                Text(badge)
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
                     .foregroundStyle(tint)
-                    .frame(width: 12)
+                    .frame(width: 16, height: 16)
+                    .background(tint.opacity(0.13), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
 
                 Text(change.fileName)
-                    .font(.system(size: 11.5))
+                    .font(.system(size: 12))
                     .lineLimit(1)
+                    .layoutPriority(1)
 
                 if !change.directory.isEmpty {
                     Text(change.directory)
-                        .font(.system(size: 10))
+                        .font(.system(size: 10.5))
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                         .truncationMode(.head)
@@ -322,22 +330,34 @@ struct ChangedFileRow: View {
 
                 Spacer(minLength: 4)
 
-                Text(change.kind.label)
-                    .font(.system(size: 9.5, weight: .medium))
-                    .foregroundStyle(tint.opacity(0.9))
+                Image(systemName: "arrow.up.forward")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .opacity(isHovering ? 1 : 0)
             }
         }
-        .help(change.originalPath.map { "\($0) → \(change.path)" } ?? change.path)
+        .help("\(change.kind.label): \(change.originalPath.map { "\($0) → \(change.path)" } ?? change.path)\nClick to open in Cursor")
+    }
+
+    private var badge: String {
+        switch change.kind {
+        case .added: return "A"
+        case .modified: return "M"
+        case .deleted: return "D"
+        case .renamed: return "R"
+        case .copied: return "C"
+        case .typeChanged: return "T"
+        case .untracked: return "U"
+        case .conflicted: return "!"
+        }
     }
 
     private var tint: Color {
         switch change.kind {
         case .added, .untracked: return .green
         case .modified, .typeChanged: return .orange
-        case .deleted: return .red
+        case .deleted, .conflicted: return .red
         case .renamed, .copied: return .blue
-        case .conflicted: return .red
         }
     }
-
 }
