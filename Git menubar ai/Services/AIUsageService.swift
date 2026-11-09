@@ -107,6 +107,35 @@ nonisolated struct AIUsageSnapshot: Sendable {
     let plan: String?
     let windows: [AIUsageWindow]
     let fetchedAt: Date
+    /// One-time limit resets saved to the account, waiting to be used.
+    var resets: [AIUsageResetCredit] = []
+}
+
+/// A saved limit reset, such as a Claude launch reset or a Codex banked
+/// reset. Using one restores the limits it covers right away.
+nonisolated struct AIUsageResetCredit: Identifiable, Equatable, Sendable {
+    let id: String
+    let title: String
+    /// What the reset restores.
+    let detail: String
+    /// The provider's own description of the offer.
+    let label: String?
+    let expiresAt: Date?
+    /// Resets left in this offer.
+    let count: Int
+    /// Why the reset cannot be used right now. Nil when it can.
+    let unavailableReason: String?
+    /// Consequences to confirm before using it.
+    let warning: String
+
+    var isUsable: Bool { unavailableReason == nil }
+}
+
+nonisolated struct AIUsageResetResult: Equatable, Sendable {
+    /// True when the limits were restored, or the reset had already been used
+    /// by this same request.
+    let restored: Bool
+    let message: String
 }
 
 nonisolated enum AIUsageError: Error, LocalizedError, Sendable {
@@ -157,21 +186,113 @@ nonisolated enum AIUsageError: Error, LocalizedError, Sendable {
 
 nonisolated protocol AIUsageLoading: Sendable {
     func load(_ provider: AIUsageProvider, claudeProfile: ClaudeAccountProfile?) async throws -> AIUsageSnapshot
+    /// Uses one saved reset. `requestID` makes a retry of the same attempt
+    /// safe: the provider redeems at most one reset per ID.
+    func redeemReset(
+        _ credit: AIUsageResetCredit,
+        provider: AIUsageProvider,
+        claudeProfile: ClaudeAccountProfile?,
+        requestID: String
+    ) async throws -> AIUsageResetResult
+}
+
+extension AIUsageLoading {
+    func redeemReset(
+        _ credit: AIUsageResetCredit,
+        provider: AIUsageProvider,
+        claudeProfile: ClaudeAccountProfile?,
+        requestID: String
+    ) async throws -> AIUsageResetResult {
+        throw AIUsageError.serviceUnavailable
+    }
 }
 
 actor AIUsageService: AIUsageLoading {
     /// Each account owns a separate cache entry. A rejection must never evict
     /// another account's token or make a refresh fall back to that account.
     private var claudeCache: [String: (token: String, expiresAt: Date?)] = [:]
+    /// Organization IDs by account, needed to claim a Claude reset.
+    private var claudeOrganizations: [String: String] = [:]
     /// Last time `kiro-cli` was asked to renew its expired sign-in, so a
     /// broken login does not launch the CLI on every refresh.
     private var kiroRenewalAttemptedAt: Date?
 
     func load(_ provider: AIUsageProvider, claudeProfile: ClaudeAccountProfile? = nil) async throws -> AIUsageSnapshot {
         let profile = claudeProfile ?? .current()
+        let request = try await mapErrors { try await self.makeRequest(for: provider, claudeProfile: profile) }
+        let data = try await send(request, provider: provider, claudeProfile: profile)
+        var snapshot = try Self.parse(data, for: provider)
+        // Codex lists reset details separately. Ask only when the usage
+        // response says one exists, and never fail the usage read over it.
+        if provider == .codex, Self.codexResetCount(data) > 0,
+           let request = try? codexRequest("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"),
+           let details = try? await send(request, provider: .codex, claudeProfile: profile) {
+            snapshot.resets = Self.parseCodexResets(details)
+        }
+        return snapshot
+    }
+
+    func redeemReset(
+        _ credit: AIUsageResetCredit,
+        provider: AIUsageProvider,
+        claudeProfile: ClaudeAccountProfile?,
+        requestID: String
+    ) async throws -> AIUsageResetResult {
+        guard Self.safeRequestID(requestID) else { throw AIUsageError.invalidResponse }
+        let profile = claudeProfile ?? .current()
+        switch provider {
+        case .claude:
+            // Claude Code accepts only these grant IDs; anything else did not
+            // come from the usage response.
+            guard Self.matches(credit.id, maxLength: 40, extra: "_-", lowercaseOnly: true) else {
+                throw AIUsageError.invalidResponse
+            }
+            let organization = try await claudeOrganization(for: profile)
+            var request = try await claudeRequest(
+                "https://api.anthropic.com/api/organizations/\(organization)/reset_rate_limits",
+                profile: profile
+            )
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: [
+                "program": "cedar_ember", "grant_id": credit.id, "request_id": requestID
+            ])
+            let data = try await send(request, provider: .claude, claudeProfile: profile)
+            return try Self.parseClaudeResetResult(data)
+        case .codex:
+            guard Self.safeIdentifier(credit.id) else { throw AIUsageError.invalidResponse }
+            var request = try await mapErrors {
+                try self.codexRequest("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume")
+            }
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: [
+                "redeem_request_id": requestID, "credit_id": credit.id
+            ])
+            let data = try await send(request, provider: .codex, claudeProfile: profile)
+            return try Self.parseCodexResetResult(data)
+        case .cursor, .kiro:
+            throw AIUsageError.serviceUnavailable
+        }
+    }
+
+    /// Runs credential and request setup with the same error mapping as the
+    /// network call.
+    private func mapErrors<T: Sendable>(_ body: () async throws -> T) async throws -> T {
         do {
             try Task.checkCancellation()
-            let request = try await makeRequest(for: provider, claudeProfile: profile)
+            return try await body()
+        } catch let error as AIUsageError {
+            throw error
+        } catch is CancellationError {
+            throw AIUsageError.cancelled
+        } catch {
+            throw AIUsageError.networkUnavailable
+        }
+    }
+
+    private func send(_ request: URLRequest, provider: AIUsageProvider, claudeProfile profile: ClaudeAccountProfile) async throws -> Data {
+        do {
             try Task.checkCancellation()
             let configuration = URLSessionConfiguration.ephemeral
             configuration.httpCookieStorage = nil
@@ -195,11 +316,14 @@ actor AIUsageService: AIUsageLoading {
             }
             switch response.statusCode {
             case 200..<300:
-                return try Self.parse(data, for: provider)
+                return data
             case 300..<400:
                 throw AIUsageError.redirectRejected
             case 401, 403:
-                if provider == .claude { claudeCache.removeValue(forKey: cacheKey(for: profile)) }
+                if provider == .claude {
+                    claudeCache.removeValue(forKey: cacheKey(for: profile))
+                    claudeOrganizations.removeValue(forKey: cacheKey(for: profile))
+                }
                 throw AIUsageError.signInRequired(provider)
             case 429:
                 throw AIUsageError.rateLimited(Self.retryDate(response, now: Date()))
@@ -247,7 +371,7 @@ actor AIUsageService: AIUsageLoading {
                     duration: duration
                 )
             }
-            return AIUsageSnapshot(plan: nil, windows: windows, fetchedAt: now)
+            return AIUsageSnapshot(plan: nil, windows: windows, fetchedAt: now, resets: parseClaudeResets(root["cedar_ember"], now: now))
         case .codex:
             let limits = root["rate_limit"] as? [String: Any] ?? [:]
             let definitions = [("primary_window", "Primary window"), ("secondary_window", "Secondary window")]
@@ -273,19 +397,10 @@ actor AIUsageService: AIUsageLoading {
     private func makeRequest(for provider: AIUsageProvider, claudeProfile: ClaudeAccountProfile) async throws -> URLRequest {
         switch provider {
         case .claude:
-            var request = try Self.usageRequest("https://api.anthropic.com/api/oauth/usage")
-            request.setValue("Bearer \(try await claudeToken(for: claudeProfile))", forHTTPHeaderField: "Authorization")
-            request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-            request.setValue("claude-code/2.1.0", forHTTPHeaderField: "User-Agent")
-            return request
+            // `cedar_ember=1` adds the account's saved limit resets.
+            return try await claudeRequest("https://api.anthropic.com/api/oauth/usage?cedar_ember=1", profile: claudeProfile)
         case .codex:
-            var request = try Self.usageRequest("https://chatgpt.com/backend-api/wham/usage")
-            let credentials = try codexCredentials()
-            request.setValue("Bearer \(credentials.token)", forHTTPHeaderField: "Authorization")
-            if let account = credentials.account {
-                request.setValue(account, forHTTPHeaderField: "ChatGPT-Account-Id")
-            }
-            return request
+            return try codexRequest("https://chatgpt.com/backend-api/wham/usage")
         case .cursor:
             var request = try Self.usageRequest("https://cursor.com/api/usage-summary")
             request.setValue(try cursorCookie(), forHTTPHeaderField: "Cookie")
@@ -314,6 +429,58 @@ actor AIUsageService: AIUsageLoading {
         request.httpShouldHandleCookies = false
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         return request
+    }
+
+    private func claudeRequest(_ endpoint: String, profile: ClaudeAccountProfile) async throws -> URLRequest {
+        var request = try Self.usageRequest(endpoint)
+        request.setValue("Bearer \(try await claudeToken(for: profile))", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        // The service offers saved resets only to Claude Code, which it
+        // recognizes by this user agent and a current version.
+        request.setValue("claude-cli/\(Self.claudeCodeVersion) (external, cli)", forHTTPHeaderField: "User-Agent")
+        return request
+    }
+
+    private func codexRequest(_ endpoint: String) throws -> URLRequest {
+        var request = try Self.usageRequest(endpoint)
+        let credentials = try codexCredentials()
+        request.setValue("Bearer \(credentials.token)", forHTTPHeaderField: "Authorization")
+        if let account = credentials.account {
+            request.setValue(account, forHTTPHeaderField: "ChatGPT-Account-Id")
+        }
+        return request
+    }
+
+    /// The newest Claude Code installed by its native installer, or a recent
+    /// release when none is found.
+    nonisolated static let claudeCodeVersion: String = {
+        let versions = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/share/claude/versions", isDirectory: true)
+        let installed = ((try? FileManager.default.contentsOfDirectory(atPath: versions.path)) ?? [])
+            .compactMap { name -> [Int]? in
+                let parts = name.split(separator: ".", omittingEmptySubsequences: false).map { Int($0) }
+                guard parts.count == 3, parts.allSatisfy({ $0 != nil && $0! >= 0 }) else { return nil }
+                return parts.compactMap { $0 }
+            }
+            .max { $0.lexicographicallyPrecedes($1) }
+        return installed.map { $0.map(String.init).joined(separator: ".") } ?? "2.1.319"
+    }()
+
+    /// Resets are claimed per organization. Its ID comes from the account's
+    /// own profile, so each Claude account claims only its own reset.
+    private func claudeOrganization(for profile: ClaudeAccountProfile) async throws -> String {
+        let key = cacheKey(for: profile)
+        if let cached = claudeOrganizations[key] { return cached }
+        let request = try await claudeRequest("https://api.anthropic.com/api/oauth/profile", profile: profile)
+        let data = try await send(request, provider: .claude, claudeProfile: profile)
+        guard let root = Self.jsonObject(data),
+              let organization = root["organization"] as? [String: Any],
+              let id = organization["uuid"] as? String,
+              Self.matches(id, maxLength: 64, extra: "-", lowercaseOnly: false) else {
+            throw AIUsageError.invalidResponse
+        }
+        claudeOrganizations[key] = id
+        return id
     }
 
     private func cacheKey(for profile: ClaudeAccountProfile) -> String {
@@ -687,6 +854,143 @@ actor AIUsageService: AIUsageLoading {
         payload += String(repeating: "=", count: (4 - payload.count % 4) % 4)
         guard let data = Data(base64Encoded: payload) else { return nil }
         return jsonObject(data)
+    }
+
+    // MARK: - Limit resets
+
+    /// Parses the `cedar_ember` block of Claude's usage response: offers
+    /// ("grants") that each hold one or more resets.
+    nonisolated static func parseClaudeResets(_ value: Any?, now: Date) -> [AIUsageResetCredit] {
+        guard let status = value as? [String: Any], boolean(status["eligible"]) == true else { return [] }
+        let nextGrant = status["next_grant_id"] as? String
+        let grants = (status["grants"] as? [Any] ?? []).prefix(20).compactMap { $0 as? [String: Any] }
+        return grants.compactMap { grant -> AIUsageResetCredit? in
+            guard let id = grant["id"] as? String,
+                  matches(id, maxLength: 40, extra: "_-", lowercaseOnly: true),
+                  let left = nonnegative(grant["resets_left"]), left >= 1 else { return nil }
+            let expiresAt = isoDate(grant["ends_at"])
+            if let expiresAt, expiresAt <= now { return nil }
+
+            let type = grant["type"] as? String
+            let clears = (grant["clears"] as? [Any] ?? []).compactMap { $0 as? String }
+            let session = type == "session" || type == "full" || (type == nil && clears.contains("five_hour"))
+            let weekly = type == "weekly" || type == "full" || (type == nil && clears.contains { $0.hasPrefix("seven_day") })
+            let scope = resetScope(session: session, weekly: weekly)
+
+            var reason: String?
+            if let start = isoDate(grant["starts_at"]), start > now {
+                reason = "Not available yet"
+            } else if boolean(grant["paused"]) == true {
+                reason = "Paused"
+            } else if let nextGrant, nextGrant != id {
+                reason = "Use your other reset first"
+            } else if boolean(grant["usable_now"]) == false {
+                switch grant["unavailable_reason"] as? String {
+                case "cooldown": reason = "Cooling down after a recent reset"
+                case "needs_limit": reason = "Usable once you reach a limit"
+                case "cannot_clear": reason = "Nothing for it to restore right now"
+                case let blocked? where blocked.hasPrefix("blocked_"):
+                    reason = "A limit this reset doesn't cover is blocking you"
+                default: reason = "Not available right now"
+                }
+            }
+
+            return AIUsageResetCredit(
+                id: id,
+                title: scope.title,
+                detail: scope.detail,
+                label: displayText(grant["label"]),
+                expiresAt: expiresAt,
+                count: Int(min(left, 99)),
+                unavailableReason: reason,
+                warning: "Your weekly limit still resets on its usual day. A used reset can't be given back."
+            )
+        }
+    }
+
+    nonisolated static func codexResetCount(_ data: Data) -> Int {
+        guard let root = jsonObject(data),
+              let summary = root["rate_limit_reset_credits"] as? [String: Any],
+              let count = nonnegative(summary["available_count"]) else { return 0 }
+        return Int(min(count, 99))
+    }
+
+    /// Parses Codex's banked resets from `wham/rate-limit-reset-credits`.
+    nonisolated static func parseCodexResets(_ data: Data, now: Date = Date()) -> [AIUsageResetCredit] {
+        guard let root = jsonObject(data) else { return [] }
+        let credits = (root["credits"] as? [Any] ?? []).prefix(20).compactMap { $0 as? [String: Any] }
+        return credits.compactMap { credit -> AIUsageResetCredit? in
+            guard let id = credit["id"] as? String, safeIdentifier(id),
+                  (credit["status"] as? String) == "available" else { return nil }
+            if let type = credit["reset_type"] as? String, type != "codex_rate_limits" { return nil }
+            let expiresAt = isoDate(credit["expires_at"])
+            if let expiresAt, expiresAt <= now { return nil }
+            return AIUsageResetCredit(
+                id: id,
+                title: displayText(credit["title"]) ?? "Full reset",
+                detail: resetScope(session: true, weekly: true).detail,
+                label: displayText(credit["description"]),
+                expiresAt: expiresAt,
+                count: 1,
+                unavailableReason: boolean(credit["is_supported_by_plan"]) == false ? "Not supported by your current plan" : nil,
+                warning: "Your weekly window restarts now, so the weekly reset you're waiting for won't also happen. A used reset can't be given back."
+            )
+        }
+    }
+
+    nonisolated private static func resetScope(session: Bool, weekly: Bool) -> (title: String, detail: String) {
+        switch (session, weekly) {
+        case (true, true): return ("Full reset", "Restores your 5-hour and weekly limits")
+        case (true, false): return ("Session reset", "Restores your 5-hour session limit")
+        case (false, true): return ("Weekly reset", "Restores your weekly limit")
+        case (false, false): return ("Limit reset", "Restores the limits it covers")
+        }
+    }
+
+    nonisolated static func parseClaudeResetResult(_ data: Data) throws -> AIUsageResetResult {
+        guard let root = jsonObject(data), let result = root["result"] as? String else {
+            throw AIUsageError.invalidResponse
+        }
+        switch result {
+        case "reset":
+            return AIUsageResetResult(restored: true, message: "Your Claude limits are back to full.")
+        case "already_used":
+            return AIUsageResetResult(restored: false, message: "This reset was already used.")
+        case "not_limited":
+            return AIUsageResetResult(restored: false, message: "There was nothing to restore, so the reset was not used.")
+        case "cooldown":
+            return AIUsageResetResult(restored: false, message: "Resets are cooling down. The reset was not used. Try again later.")
+        default:
+            return AIUsageResetResult(restored: false, message: "This reset isn't available for this account right now. It was not used.")
+        }
+    }
+
+    nonisolated static func parseCodexResetResult(_ data: Data) throws -> AIUsageResetResult {
+        guard let root = jsonObject(data), let code = root["code"] as? String else {
+            throw AIUsageError.invalidResponse
+        }
+        switch code {
+        case "reset", "already_redeemed":
+            return AIUsageResetResult(restored: true, message: "Your Codex limits are back to full.")
+        case "nothing_to_reset":
+            return AIUsageResetResult(restored: false, message: "Your usage doesn't need a reset right now, so it was not used.")
+        case "no_credit":
+            return AIUsageResetResult(restored: false, message: "That reset is no longer available.")
+        default:
+            throw AIUsageError.invalidResponse
+        }
+    }
+
+    nonisolated private static func safeRequestID(_ text: String) -> Bool {
+        matches(text, maxLength: 64, extra: "_-", lowercaseOnly: false)
+    }
+
+    /// ASCII letters and digits plus `extra`, at most `maxLength` bytes.
+    nonisolated private static func matches(_ text: String, maxLength: Int, extra: String, lowercaseOnly: Bool) -> Bool {
+        !text.isEmpty && text.utf8.count <= maxLength && text.utf8.allSatisfy {
+            (97...122).contains($0) || (48...57).contains($0)
+                || (!lowercaseOnly && (65...90).contains($0)) || extra.utf8.contains($0)
+        }
     }
 
     nonisolated private static func parseCursor(_ root: [String: Any], now: Date) -> AIUsageSnapshot {

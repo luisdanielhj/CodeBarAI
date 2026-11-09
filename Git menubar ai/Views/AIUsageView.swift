@@ -127,6 +127,8 @@ private struct ProviderLimitsSection: View {
     let state: AIUsageState
     @State private var renamingAccount = false
     @State private var accountName = ""
+    /// The reset picked from the menu, waiting for confirmation.
+    @State private var confirmingReset: AIUsageResetCredit?
 
     private var primaryWindows: [AIUsageWindow] {
         state.snapshot?.windows.filter(\.isPrimary) ?? []
@@ -173,6 +175,32 @@ private struct ProviderLimitsSection: View {
             } else if state.failure == nil {
                 LimitPlaceholder()
             }
+
+            if let notice = state.resetNotice {
+                InlineBanner(
+                    kind: notice.succeeded ? .success : .warning,
+                    title: notice.message,
+                    onDismiss: { model.dismissResetNotice(for: state) }
+                )
+            }
+            if let credit = confirmingReset ?? redeemingReset {
+                LimitResetConfirmation(
+                    credit: credit,
+                    weeklyResetsAt: weeklyResetsAt,
+                    isRedeeming: state.redeemingResetID == credit.id,
+                    onCancel: { confirmingReset = nil },
+                    onConfirm: {
+                        confirmingReset = nil
+                        Task { await model.redeemReset(credit, for: state) }
+                    }
+                )
+            }
+        }
+        // Right-clicking anywhere on the account opens the same options.
+        .contentShape(Rectangle())
+        .contextMenu { options }
+        .onChange(of: state.snapshot?.resets.map(\.id) ?? []) { _, ids in
+            if let confirmingReset, !ids.contains(confirmingReset.id) { self.confirmingReset = nil }
         }
         .alert("Rename Claude Account", isPresented: $renamingAccount) {
             TextField("Account name", text: $accountName)
@@ -203,30 +231,69 @@ private struct ProviderLimitsSection: View {
                     .controlSize(.mini)
             }
             IconMenu(help: "\(state.title) options") {
-                Toggle("Show in Menu Bar", isOn: Binding(
-                    get: { model.isShownInMenuBar(state) },
-                    set: { model.setMenuBarVisibility(state, isVisible: $0) }
-                ))
-                Button("Refresh Now") { Task { await model.refresh(state) } }
-                    .disabled(state.isRefreshing || Date() < state.nextRefreshAt)
-                if let profile = state.claudeProfile {
-                    Divider()
-                    Button("Rename Account…") {
-                        accountName = profile.name
-                        renamingAccount = true
-                    }
-                    if !profile.isDefault {
-                        Button("Remove from CodeBarAI", role: .destructive) {
-                            model.removeClaudeAccount(state)
-                        }
-                    }
-                }
-                Divider()
-                Button("Disconnect", role: .destructive) { model.disconnect(state) }
+                options
             }
             .padding(.trailing, -6)
         }
         .padding(.leading, 2)
+    }
+
+    /// Items for both the options button and the right-click menu.
+    @ViewBuilder private var options: some View {
+        Toggle("Show in Menu Bar", isOn: Binding(
+            get: { model.isShownInMenuBar(state) },
+            set: { model.setMenuBarVisibility(state, isVisible: $0) }
+        ))
+        Button("Refresh Now") { Task { await model.refresh(state) } }
+            .disabled(state.isRefreshing || Date() < state.nextRefreshAt)
+        if let resets = state.snapshot?.resets, !resets.isEmpty {
+            Divider()
+            Menu("Limit Resets (\(resets.count))") {
+                ForEach(resets) { credit in
+                    Button(resetMenuTitle(credit)) { confirmingReset = credit }
+                        .disabled(!credit.isUsable || state.redeemingResetID != nil)
+                }
+            }
+        }
+        if let profile = state.claudeProfile {
+            Divider()
+            Button("Rename Account…") {
+                accountName = profile.name
+                renamingAccount = true
+            }
+            if !profile.isDefault {
+                Button("Remove from CodeBarAI", role: .destructive) {
+                    model.removeClaudeAccount(state)
+                }
+            }
+        }
+        Divider()
+        Button("Disconnect", role: .destructive) { model.disconnect(state) }
+    }
+
+    private func resetMenuTitle(_ credit: AIUsageResetCredit) -> String {
+        var title = "Use \(credit.title)"
+        if credit.count > 1 { title += " (×\(credit.count))" }
+        if let reason = credit.unavailableReason {
+            title += " · \(reason)"
+        } else if let expiresAt = credit.expiresAt {
+            title += "… · expires in \(DurationText.short(expiresAt.timeIntervalSinceNow))"
+        } else {
+            title += "…"
+        }
+        return title
+    }
+
+    /// The reset being used, kept on screen until the request finishes.
+    private var redeemingReset: AIUsageResetCredit? {
+        state.redeemingResetID.flatMap { id in state.snapshot?.resets.first { $0.id == id } }
+    }
+
+    /// When the weekly limit would reset without using a reset.
+    private var weeklyResetsAt: Date? {
+        state.snapshot?.windows.first { window in
+            window.isPrimary && window.duration.map { abs($0 - 7 * 86_400) < 3_600 } == true
+        }?.resetsAt
     }
 }
 
@@ -524,6 +591,76 @@ private struct CompactLimitRow: View {
                 .frame(width: 34, alignment: .trailing)
         }
         .help(metrics.summary)
+    }
+}
+
+// MARK: - Limit resets
+
+/// Confirms a reset picked from the account's menu. Shown only on request.
+private struct LimitResetConfirmation: View {
+    let credit: AIUsageResetCredit
+    let weeklyResetsAt: Date?
+    let isRedeeming: Bool
+    let onCancel: () -> Void
+    let onConfirm: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: "arrow.counterclockwise.circle.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                Text("Use \(credit.title)?")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if let expiresAt = credit.expiresAt {
+                    Text("Expires in \(DurationText.short(expiresAt.timeIntervalSinceNow))")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
+            Text(confirmation(now: .now))
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                Spacer(minLength: 0)
+                if isRedeeming {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Using reset")
+                } else {
+                    Button("Cancel", action: onCancel)
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11, weight: .medium))
+                        .padding(.horizontal, 10)
+                        .frame(height: 22)
+                        .background(Color.primary.opacity(0.07), in: Capsule())
+                    Button("Use Reset", action: onConfirm)
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10)
+                        .frame(height: 22)
+                        .background(Color.accentColor, in: Capsule())
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .card()
+        .help(credit.label ?? credit.detail)
+    }
+
+    private func confirmation(now: Date) -> String {
+        var parts = ["\(credit.detail) right away."]
+        if let weeklyResetsAt, weeklyResetsAt > now {
+            parts.append("Without it, your weekly limit resets in \(DurationText.short(weeklyResetsAt.timeIntervalSince(now))).")
+        }
+        parts.append(credit.warning)
+        return parts.joined(separator: " ")
     }
 }
 

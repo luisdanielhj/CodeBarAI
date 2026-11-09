@@ -16,6 +16,13 @@ final class AIUsageState: Identifiable {
     var failure: String?
     var nextRefreshAt = Date.distantPast
     var generation = UUID()
+    /// The reset being used right now.
+    var redeemingResetID: String?
+    /// Outcome of the last reset, shown until dismissed.
+    var resetNotice: AIUsageResetNotice?
+    /// Request IDs of attempts that ended without an answer, kept so a retry
+    /// cannot use a second reset.
+    var pendingResetRequestIDs: [String: String] = [:]
 
     init(provider: AIUsageProvider, isInstalled: Bool, isEnabled: Bool, claudeProfile: ClaudeAccountProfile? = nil) {
         self.provider = provider
@@ -23,6 +30,11 @@ final class AIUsageState: Identifiable {
         self.isInstalled = isInstalled
         self.isEnabled = isEnabled
     }
+}
+
+struct AIUsageResetNotice: Equatable {
+    let succeeded: Bool
+    let message: String
 }
 
 @Observable
@@ -243,7 +255,55 @@ final class AIUsageModel {
         state.snapshot = nil
         state.failure = nil
         state.nextRefreshAt = .distantPast
+        state.redeemingResetID = nil
+        state.resetNotice = nil
+        state.pendingResetRequestIDs = [:]
         defaults.set(false, forKey: "usage.enabled.\(state.id)")
+    }
+
+    /// Uses one saved reset, then reads usage again to show the new limits.
+    func redeemReset(_ credit: AIUsageResetCredit, for state: AIUsageState) async {
+        guard state.isEnabled, state.redeemingResetID == nil, credit.isUsable,
+              states.contains(where: { $0 === state }),
+              state.snapshot?.resets.contains(where: { $0.id == credit.id }) == true else { return }
+        let generation = state.generation
+        let requestID = state.pendingResetRequestIDs[credit.id] ?? UUID().uuidString.lowercased()
+        state.pendingResetRequestIDs[credit.id] = requestID
+        state.redeemingResetID = credit.id
+        state.resetNotice = nil
+
+        let notice: AIUsageResetNotice
+        var mayRefresh = true
+        do {
+            let result = try await service.redeemReset(
+                credit,
+                provider: state.provider,
+                claudeProfile: state.claudeProfile,
+                requestID: requestID
+            )
+            guard state.generation == generation else { return }
+            state.pendingResetRequestIDs[credit.id] = nil
+            notice = AIUsageResetNotice(succeeded: result.restored, message: result.message)
+        } catch {
+            guard state.generation == generation else { return }
+            let reason = (error as? AIUsageError)?.errorDescription ?? "The reset service is unavailable."
+            mayRefresh = (error as? AIUsageError)?.retryAt == nil
+            notice = AIUsageResetNotice(
+                succeeded: false,
+                message: "Couldn't confirm the reset. \(reason) Trying again won't use a second reset."
+            )
+        }
+        state.redeemingResetID = nil
+        state.resetNotice = notice
+        // Read the new limits and the remaining resets right away, unless the
+        // service asked to wait.
+        guard mayRefresh else { return }
+        state.nextRefreshAt = .distantPast
+        await refresh(state)
+    }
+
+    func dismissResetNotice(for state: AIUsageState) {
+        state.resetNotice = nil
     }
 
     /// Keeps usage current for the status item, which has no view lifecycle of
