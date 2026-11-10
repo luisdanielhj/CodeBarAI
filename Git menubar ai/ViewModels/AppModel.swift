@@ -41,7 +41,7 @@ final class AppModel {
     /// The Settings screen covers whatever was showing; closing it returns there.
     var isShowingSettings = false
 
-    /// Rescans the local Claude Code and Codex logs, including every Claude account.
+    /// Rescans the local Claude Code, Codex and Kiro logs, including every Claude account.
     func refreshTokenUsage(force: Bool = false) async {
         let directories = usage.claudeAccounts.compactMap(\.claudeProfile?.configDirectory)
         await tokens.refresh(claudeDirectories: directories, force: force)

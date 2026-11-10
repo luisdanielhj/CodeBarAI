@@ -1,7 +1,8 @@
 import Foundation
 import Observation
 
-/// API-equivalent cost and token counts from local Claude Code and Codex logs.
+/// API-equivalent cost and token counts from local Claude Code and Codex logs,
+/// plus Kiro's credits valued at its plan price.
 @Observable
 final class TokenUsageModel {
     private(set) var report: UsageReport?
@@ -21,10 +22,11 @@ final class TokenUsageModel {
         defer { isScanning = false }
 
         let codex = Self.codexDirectory()
+        let kiro = Self.kiroDirectory()
         let claude = Array(Set(claudeDirectories.map(\.standardizedFileURL)))
         let scanner = scanner
         let result = await Task.detached(priority: .utility) {
-            await scanner.scan(claudeDirectories: claude, codexDirectories: [codex])
+            await scanner.scan(claudeDirectories: claude, codexDirectories: [codex], kiroDirectories: [kiro])
         }.value
         if report != result { report = result }
         lastScan = Date()
@@ -35,5 +37,10 @@ final class TokenUsageModel {
             return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath, isDirectory: true)
         }
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true)
+    }
+
+    /// Shared by Kiro CLI and the Kiro IDE.
+    private static func kiroDirectory() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kiro", isDirectory: true)
     }
 }

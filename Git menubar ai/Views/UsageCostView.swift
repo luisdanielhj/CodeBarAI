@@ -37,16 +37,33 @@ enum UsageFormat {
     static func value(_ totals: UsageTotals, _ metric: UsageMetric) -> String {
         metric == .cost ? cost(totals.cost) : tokens(totals.tokens.total)
     }
+
+    static func credits(_ value: Double) -> String {
+        let digits = value >= 100 ? 0 : 1
+        let number = value.formatted(.number.precision(.fractionLength(digits)).locale(Locale(identifier: "en_US")))
+        return number + (number == "1" || number == "1.0" ? " credit" : " credits")
+    }
+
+    /// Token count for the cost screens' detail text, or credits for Kiro,
+    /// whose cost comes from its credits.
+    static func costDetail(_ totals: UsageTotals, source: UsageSource) -> String {
+        source == .kiro ? credits(totals.credits) : tokens(totals.tokens.total)
+    }
 }
 
 extension UsageSource {
-    /// Matches the bar colors on the Limits screen.
+    /// Matches the bar colors on the Limits screen. Kiro gets its brand purple
+    /// so its bars stay distinct from Codex's gray.
     var chartColor: Color {
         switch self {
         case .claude: return Color(red: 0.85, green: 0.47, blue: 0.34)
         case .codex: return Color.primary.opacity(0.45)
+        case .kiro: return Color(red: 0.56, green: 0.33, blue: 0.96)
         }
     }
+
+    /// Kiro logs no token counts, so its tokens are estimated.
+    var tokensAreEstimated: Bool { self == .kiro }
 }
 
 /// The Cost or Tokens screen: four period totals, a chart for the selected
@@ -63,7 +80,7 @@ struct UsageReportView: View {
                     EmptyState(
                         systemImage: "doc.text.magnifyingglass",
                         title: "No usage logs found",
-                        message: "Cost and tokens are read from Claude Code and Codex session logs on this Mac."
+                        message: "Cost and tokens are read from Claude Code, Codex and Kiro session logs on this Mac."
                     )
                 } else {
                     PeriodGrid(report: report, metric: metric, selection: $period)
@@ -73,8 +90,11 @@ struct UsageReportView: View {
                         TokenTypeBreakdown(tokens: current.totals.tokens)
                     }
                     SourceBreakdown(report: current, metric: metric, sourcesFound: report.sourcesFound)
+                    if metric == .cost, report.sourcesFound.contains(.kiro) {
+                        KiroCostBreakdown(totals: current.bySource[.kiro] ?? UsageTotals())
+                    }
                     ModelBreakdown(report: current, metric: metric)
-                    footnote(current)
+                    footnote(current, sourcesFound: report.sourcesFound)
                 }
             } else {
                 VStack(spacing: 10) {
@@ -93,12 +113,17 @@ struct UsageReportView: View {
         }
     }
 
-    private func footnote(_ report: PeriodReport) -> some View {
+    private func footnote(_ report: PeriodReport, sourcesFound: Set<UsageSource>) -> some View {
         var text = metric == .cost
             ? "Estimated at standard API list prices from your local Claude Code and Codex logs. Plans bill differently, so this is what the same usage would cost on the API."
             : "Counted from your local Claude Code and Codex logs. Cache reads are prompt tokens served from the cache."
         if metric == .cost, report.totals.unpricedTokens > 0 {
             text += " \(UsageFormat.tokens(report.totals.unpricedTokens)) tokens from models without a public API price are not included."
+        }
+        if sourcesFound.contains(.kiro) {
+            text += metric == .cost
+                ? " Kiro logs no token counts, so its API price is estimated from the context-window usage it logs, assuming prompt caching. Its credits and plan rate are in the Kiro section."
+                : " Kiro logs no token counts. Its tokens are estimated from the context-window usage it logs, assuming prompt caching, and miss thinking Kiro does not record."
         }
         text += " Cursor keeps no local usage log."
         return Text(text)
@@ -233,10 +258,10 @@ private struct UsageChart: View {
                 .foregroundStyle(by: .value("Tool", point.source.title))
                 .cornerRadius(2)
             }
-            .chartForegroundStyleScale([
-                UsageSource.claude.title: UsageSource.claude.chartColor,
-                UsageSource.codex.title: UsageSource.codex.chartColor
-            ])
+            .chartForegroundStyleScale(
+                domain: UsageSource.allCases.map(\.title),
+                range: UsageSource.allCases.map(\.chartColor)
+            )
             .chartLegend(.hidden)
             .chartYAxis {
                 AxisMarks(position: .trailing, values: .automatic(desiredCount: 3)) { value in
@@ -325,7 +350,9 @@ private struct SourceBreakdown: View {
                     let value = metric == .cost ? totals.cost : Double(totals.tokens.total)
                     ShareRow(
                         value: UsageFormat.value(totals, metric),
-                        detail: metric == .cost ? UsageFormat.tokens(totals.tokens.total) : nil,
+                        detail: metric == .cost
+                            ? UsageFormat.costDetail(totals, source: source)
+                            : (source.tokensAreEstimated ? "est." : nil),
                         share: total > 0 ? value / total : 0,
                         tint: source.chartColor
                     ) {
@@ -384,12 +411,14 @@ private struct ModelBreakdown: View {
                                 ? "No API price"
                                 : UsageFormat.value(usage.totals, metric),
                             detail: metric == .cost
-                                ? UsageFormat.tokens(usage.totals.tokens.total)
-                                : "\(usage.totals.requests) req",
+                                ? UsageFormat.costDetail(usage.totals, source: usage.source)
+                                : (usage.source.tokensAreEstimated ? "est. · " : "") + "\(usage.totals.requests) req",
                             share: total > 0 ? value / total : 0,
                             tint: usage.source.chartColor
                         ) {
-                            Text(ModelPricing.displayName(for: usage.model))
+                            // Kiro serves the same Claude models as Claude Code, so name the tool.
+                            Text(ModelPricing.displayName(for: usage.model)
+                                 + (usage.source == .kiro ? " · Kiro" : ""))
                                 .font(.system(size: 12))
                                 .lineLimit(1)
                                 .help(usage.model)
@@ -399,6 +428,51 @@ private struct ModelBreakdown: View {
                 .padding(12)
                 .card()
             }
+        }
+    }
+}
+
+/// Kiro's estimated API price, which is its cost everywhere on this screen,
+/// next to its credits and what they cost at the plan rate.
+private struct KiroCostBreakdown: View {
+    let totals: UsageTotals
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SectionHeader(title: "Kiro")
+                .padding(.leading, 2)
+            VStack(alignment: .leading, spacing: 10) {
+                row("API price", detail: "estimate", value: UsageFormat.cost(totals.cost))
+                    .help("What the same work would cost at API list prices. Kiro logs no token counts, so tokens are estimated from the context-window usage it logs, assuming prompt caching. Thinking Kiro does not record is missed, so the real figure is likely higher.")
+                row("Credits used", value: UsageFormat.credits(totals.credits))
+                row("At plan rate",
+                    detail: "\(UsageFormat.cost(ModelPricing.kiroCreditPrice))/credit",
+                    value: UsageFormat.cost(totals.credits * ModelPricing.kiroCreditPrice))
+                if totals.creditsWithoutAPIPrice > 0 {
+                    Text("\(UsageFormat.credits(totals.creditsWithoutAPIPrice)) used on Auto have no single API price and are left out of the API price.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(12)
+            .card()
+        }
+    }
+
+    private func row(_ title: String, detail: String? = nil, value: String) -> some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 12))
+            Spacer(minLength: 6)
+            if let detail {
+                Text(detail)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.tertiary)
+            }
+            Text(value)
+                .font(.system(size: 12, weight: .medium))
+                .monospacedDigit()
         }
     }
 }

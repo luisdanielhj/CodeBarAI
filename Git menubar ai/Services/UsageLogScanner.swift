@@ -1,7 +1,8 @@
 import Darwin
 import Foundation
 
-/// Reads token usage from the session logs Claude Code and Codex keep on disk.
+/// Reads token usage from the session logs Claude Code and Codex keep on disk,
+/// and credit usage from the session logs Kiro keeps in `~/.kiro/sessions`.
 ///
 /// The logs are append-only JSONL files and can add up to gigabytes, so each
 /// file is parsed once and then only from where the last scan stopped. The
@@ -19,18 +20,26 @@ actor UsageLogScanner {
         var offset: UInt64
         var entries: [UsageEntry] = []
 
-        // Codex only.
+        // Codex and Kiro.
         /// Entries derived from cumulative `token_count` events, used only for
         /// older logs that have no per-response `token_usage_record` lines.
         var fallbackEntries: [UsageEntry] = []
         var hasUsageRecords = false
+        /// The model of the latest response, for turns that do not name one.
         var currentModel: String?
+        /// Codex turn ids to the model that answered.
         var turnModels: [String: String] = [:]
         var lastCumulative: TokenCounts?
+
+        // Kiro only.
+        /// Token estimates for prompts that have not finished, by execution id.
+        var kiroTurns: [String: KiroUsageEstimator.Turn] = [:]
+        var kiroContext = KiroUsageEstimator.Context()
     }
 
     private struct Cache: Codable {
-        static let currentVersion = 1
+        /// 2: Kiro entries carry token and API cost estimates.
+        static let currentVersion = 2
         var version = currentVersion
         var files: [String: FileState] = [:]
     }
@@ -58,7 +67,7 @@ actor UsageLogScanner {
 
     // MARK: - Scanning
 
-    func scan(claudeDirectories: [URL], codexDirectories: [URL], now: Date = Date()) -> UsageReport {
+    func scan(claudeDirectories: [URL], codexDirectories: [URL], kiroDirectories: [URL] = [], now: Date = Date()) -> UsageReport {
         var cache = loadCache()
         let cutoff = now.addingTimeInterval(-Self.retention)
         var changed = false
@@ -71,9 +80,11 @@ actor UsageLogScanner {
                 [($0.appendingPathComponent("sessions", isDirectory: true), UsageSource.codex),
                  ($0.appendingPathComponent("archived_sessions", isDirectory: true), .codex)]
             }
+            + kiroDirectories.map { ($0.appendingPathComponent("sessions", isDirectory: true), .kiro) }
 
         for (root, source) in roots {
-            for file in Self.logFiles(in: root) {
+            let files = source == .kiro ? Self.kiroLogFiles(in: root) : Self.logFiles(in: root)
+            for file in files {
                 sourcesFound.insert(source)
                 guard file.modified >= cutoff, seenPaths.insert(file.path).inserted else { continue }
 
@@ -136,6 +147,32 @@ actor UsageLogScanner {
         return files
     }
 
+    /// Kiro keeps `sessions/<workspace>/sess_<id>/messages.jsonl`, next to
+    /// file snapshots and subagent logs. Only the top-level message log is
+    /// read: a prompt's credits already include the subagents it started.
+    private static func kiroLogFiles(in root: URL) -> [LogFile] {
+        let manager = FileManager.default
+        let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+        guard let workspaces = try? manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        else { return [] }
+
+        var files: [LogFile] = []
+        for workspace in workspaces {
+            guard let sessions = try? manager.contentsOfDirectory(at: workspace, includingPropertiesForKeys: nil)
+            else { continue }
+            for session in sessions where session.lastPathComponent.hasPrefix("sess_") {
+                let url = session.appendingPathComponent("messages.jsonl")
+                guard let values = try? url.resourceValues(forKeys: Set(keys)),
+                      values.isRegularFile == true,
+                      let size = values.fileSize,
+                      let modified = values.contentModificationDate
+                else { continue }
+                files.append(LogFile(path: url.path, size: UInt64(size), modified: modified))
+            }
+        }
+        return files
+    }
+
     // MARK: - Parsing
 
     private func parse(file: LogFile, source: UsageSource, into state: inout FileState) {
@@ -160,6 +197,8 @@ actor UsageLogScanner {
                     parseClaudeLine(line, path: file.path, offset: lineStart, into: &state)
                 case .codex:
                     parseCodexLine(line, path: file.path, offset: lineStart, into: &state)
+                case .kiro:
+                    parseKiroLine(line, path: file.path, offset: lineStart, into: &state)
                 }
                 lineStart = lineEnd + 1
             }
@@ -305,6 +344,121 @@ actor UsageLogScanner {
         default:
             return
         }
+    }
+
+    /// Kiro writes one `usage_summary` line when a prompt finishes, with the
+    /// credits it used across all its requests, subagents included. The model
+    /// comes from the prompt's reasoning blocks (`qdev::claude-opus-5.5`), else
+    /// from the previous prompt, else from the session's current model.
+    ///
+    /// Token counts and the API cost are estimates; see `KiroUsageEstimator`.
+    private func parseKiroLine(_ line: UnsafeRawBufferPointer, path: String, offset: Int, into state: inout FileState) {
+        guard line.count > 0,
+              Self.contains(line, "\"assistant\"")
+                || Self.contains(line, "\"tool_call\"")
+                || Self.contains(line, "\"contextUsage\"")
+                || Self.contains(line, "\"usage_summary\"")
+                || Self.contains(line, "\"sub_agent_start\""),
+              let object = Self.object(line),
+              let payload = object["payload"] as? [String: Any],
+              let type = payload["type"] as? String
+        else { return }
+
+        let execution = (payload["executionId"] as? String) ?? (payload["parentExecutionId"] as? String)
+        func model() -> String {
+            if let model = execution.flatMap({ state.kiroTurns[$0]?.model }) { return model }
+            if state.currentModel == nil { state.currentModel = Self.kiroSessionModel(messagesPath: path) }
+            return state.currentModel ?? "auto"
+        }
+
+        switch type {
+        case "assistant", "tool_call":
+            guard let execution else { return }
+            if let raw = payload["reasoningModelId"] as? String, !raw.isEmpty {
+                let name = raw.components(separatedBy: "::").last ?? raw
+                state.currentModel = name
+                state.kiroTurns[execution, default: .init()].model = name
+            }
+            let text = KiroUsageEstimator.textLength(type == "assistant" ? payload["content"] : payload["args"])
+            state.kiroTurns[execution, default: .init()].tokens.output += KiroUsageEstimator.tokens(characters: text)
+
+        case "session_metadata":
+            guard let execution,
+                  payload["key"] as? String == "contextUsage",
+                  let value = payload["value"] as? [String: Any],
+                  let percent = (value["usagePercentage"] as? NSNumber)?.doubleValue
+            else { return }
+            let name = model()
+            KiroUsageEstimator.addRequest(
+                percent: percent,
+                date: date(object["timestamp"]),
+                model: name,
+                to: &state.kiroTurns[execution, default: .init()],
+                context: &state.kiroContext
+            )
+
+        case "sub_agent_start":
+            guard let execution, let id = payload["subSessionId"] as? String else { return }
+            let prompt = KiroUsageEstimator.textLength(payload["prompt"])
+            state.kiroTurns[execution, default: .init()].subSessions.append(.init(id: id, promptCharacters: prompt))
+
+        case "usage_summary":
+            guard let summaries = payload["promptTurnSummaries"] as? [[String: Any]],
+                  let date = date(object["timestamp"])
+            else { return }
+            let credits = summaries
+                .filter { ($0["unit"] as? String)?.lowercased().hasPrefix("credit") == true }
+                .reduce(0.0) { $0 + ((($1["usage"] as? NSNumber)?.doubleValue) ?? 0) }
+            let name = model()
+            let turn = execution.flatMap { state.kiroTurns.removeValue(forKey: $0) } ?? .init()
+            guard credits > 0 else { return }
+
+            let requests = max((payload["requestIds"] as? [Any])?.count ?? turn.requests, 1)
+            var estimate = KiroUsageEstimator.Estimate(
+                tokens: turn.tokens,
+                apiCost: KiroUsageEstimator.apiCost(turn.tokens, requests: turn.requests, model: name)
+            )
+            if !turn.subSessions.isEmpty {
+                let directory = URL(fileURLWithPath: path)
+                    .deletingLastPathComponent()
+                    .appendingPathComponent("sub-executions", isDirectory: true)
+                estimate.add(KiroUsageEstimator.subagents(
+                    turn.subSessions,
+                    directory: directory,
+                    // Context sizes are logged for main-agent requests only;
+                    // the rest of the prompt's requests were the subagents'.
+                    requests: requests - turn.requests,
+                    baseContext: state.kiroContext.smallest ?? KiroUsageEstimator.defaultBaseContext,
+                    fallbackModel: name
+                ))
+            }
+            state.entries.append(UsageEntry(
+                key: execution.map { "k:\($0)" } ?? "k:\(path):\(offset)",
+                date: date,
+                source: .kiro,
+                model: name,
+                tokens: estimate.tokens,
+                credits: credits,
+                requestCount: requests,
+                estimatedAPICost: estimate.apiCost
+            ))
+
+        default:
+            return
+        }
+    }
+
+    /// The model selected for a Kiro session, from the `session.json` next to
+    /// its message log.
+    private static func kiroSessionModel(messagesPath: String) -> String? {
+        let url = URL(fileURLWithPath: messagesPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("session.json")
+        guard let data = try? Data(contentsOf: url),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let model = object["modelId"] as? String, !model.isEmpty
+        else { return nil }
+        return model
     }
 
     // MARK: - Aggregation

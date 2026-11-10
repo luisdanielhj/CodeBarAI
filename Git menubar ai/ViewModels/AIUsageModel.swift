@@ -14,6 +14,10 @@ final class AIUsageState: Identifiable {
     var isRefreshing = false
     var snapshot: AIUsageSnapshot?
     var failure: String?
+    /// The saved sign-in is encrypted and the user has not yet let this app
+    /// read the Keychain key for it.
+    var needsKeychainApproval = false
+    var isRequestingKeychainAccess = false
     var nextRefreshAt = Date.distantPast
     var generation = UUID()
     /// The reset being used right now.
@@ -254,6 +258,7 @@ final class AIUsageModel {
         state.isRefreshing = false
         state.snapshot = nil
         state.failure = nil
+        state.needsKeychainApproval = false
         state.nextRefreshAt = .distantPast
         state.redeemingResetID = nil
         state.resetNotice = nil
@@ -306,6 +311,28 @@ final class AIUsageModel {
         state.resetNotice = nil
     }
 
+    /// Lets the service read the Keychain key the provider's sign-in is
+    /// encrypted with. macOS asks the user first, which is why this runs only
+    /// from a button.
+    func allowKeychainAccess(for state: AIUsageState) async {
+        guard state.isEnabled, !state.isRequestingKeychainAccess else { return }
+        let generation = state.generation
+        state.isRequestingKeychainAccess = true
+        defer {
+            if state.generation == generation { state.isRequestingKeychainAccess = false }
+        }
+        do {
+            try await service.allowKeychainAccess(for: state.provider)
+        } catch {
+            guard state.generation == generation else { return }
+            state.failure = (error as? AIUsageError)?.errorDescription ?? "Could not read the Keychain."
+            return
+        }
+        guard state.generation == generation else { return }
+        state.nextRefreshAt = .distantPast
+        await refresh(state)
+    }
+
     /// Keeps usage current for the status item, which has no view lifecycle of
     /// its own to run a refresh loop from. Idempotent.
     func startAutoRefresh(every interval: Duration = .seconds(60)) {
@@ -356,10 +383,16 @@ final class AIUsageModel {
             guard state.isEnabled, state.generation == generation else { return }
             state.snapshot = snapshot
             state.failure = nil
+            state.needsKeychainApproval = false
             state.nextRefreshAt = Date().addingTimeInterval(300)
         } catch {
             guard state.isEnabled, state.generation == generation else { return }
             state.failure = (error as? AIUsageError)?.errorDescription ?? "Usage is temporarily unavailable."
+            if case .keychainApprovalRequired = error as? AIUsageError {
+                state.needsKeychainApproval = true
+            } else {
+                state.needsKeychainApproval = false
+            }
             state.nextRefreshAt = (error as? AIUsageError)?.retryAt ?? Date().addingTimeInterval(60)
         }
     }

@@ -79,9 +79,18 @@ nonisolated enum ModelPricing {
         return table.first { id.hasPrefix($0.prefix) }?.price
     }
 
+    /// Kiro bills in credits, not tokens. The Power plan is $200 a month for
+    /// 10,000 credits, so a credit is valued at $0.02. Shown for comparison;
+    /// Kiro's cost is its estimated API price.
+    static let kiroPlanPrice = 200.0
+    static let kiroPlanCredits = 10_000.0
+    static var kiroCreditPrice: Double { kiroPlanPrice / kiroPlanCredits }
+
     /// `nil` when the model has no published API price, such as Codex's
-    /// auto-review agent or a bare alias like `sonnet`.
+    /// auto-review agent, a bare alias like `sonnet`, or Kiro's Auto.
     static func cost(of entry: UsageEntry) -> Double? {
+        // Kiro logs no token counts; the scanner estimates the API price.
+        if entry.source == .kiro { return entry.estimatedAPICost }
         guard let price = price(for: entry.model, promptTokens: entry.tokens.prompt) else { return nil }
         var cost = price.cost(of: entry.tokens)
         // Claude 4.6 and later bill US-only inference at 1.1x.
@@ -93,6 +102,7 @@ nonisolated enum ModelPricing {
     static func displayName(for model: String) -> String {
         let id = model.lowercased()
         if id == "codex-auto-review" { return "Codex auto-review" }
+        if id == "auto" { return "Auto" }
         if id.hasPrefix("gpt-") {
             // gpt-6.1-sol → GPT-6.1 Sol
             let parts = id.split(separator: "-").map(String.init)

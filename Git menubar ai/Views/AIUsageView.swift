@@ -150,6 +150,12 @@ private struct ProviderLimitsSection: View {
                 )
             }
 
+            if state.needsKeychainApproval {
+                KeychainApprovalCard(isRequesting: state.isRequestingKeychainAccess) {
+                    Task { await model.allowKeychainAccess(for: state) }
+                }
+            }
+
             if let snapshot = state.snapshot {
                 if snapshot.windows.isEmpty {
                     Text("This plan reports no usage limits.")
@@ -595,6 +601,41 @@ private struct CompactLimitRow: View {
 }
 
 // MARK: - Limit resets
+
+/// Asks before reading Cursor's Keychain key. The macOS prompt that follows
+/// names "security", the Apple tool that reads the key.
+private struct KeychainApprovalCard: View {
+    let isRequesting: Bool
+    let onAllow: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Cursor keeps its sign-in encrypted with a key in your Keychain. macOS will ask whether “security” may use “Cursor Safe Storage”. Choose Always Allow so it doesn't ask again.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                Spacer(minLength: 0)
+                if isRequesting {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Waiting for Keychain access")
+                } else {
+                    Button("Allow Keychain Access", action: onAllow)
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10)
+                        .frame(height: 22)
+                        .background(Color.accentColor, in: Capsule())
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .card()
+    }
+}
 
 /// Confirms a reset picked from the account's menu. Shown only on request.
 private struct LimitResetConfirmation: View {

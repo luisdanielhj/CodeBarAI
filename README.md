@@ -107,7 +107,7 @@ Choosing an account starts Claude with that account's config and Keychain locati
 CodeBarAI is **not sandboxed**, because it needs to run `git` and read your AI tools' local sign-in data. macOS may ask you for:
 
 - **Automation (Terminal)**: to open a Terminal window and run `claude` or your dev server command in it.
-- **Keychain access**: only if a tool stores its credentials in the Keychain. The app never opens a Keychain prompt by itself. If access is denied, it shows a message and you can allow access in Keychain Access.
+- **Keychain access**: only if a tool stores its credentials in the Keychain. The app never opens a Keychain prompt by itself. If access is denied, it shows a message and you can allow access in Keychain Access. Cursor is the exception that asks: its sign-in is encrypted, and the key is read only when you click **Allow Keychain Access**. macOS then asks whether `security` may use `Cursor Safe Storage`; choose **Always Allow**. The key is kept in memory only.
 
 ## Privacy and how usage is read
 
@@ -117,7 +117,7 @@ The usage numbers come from your own subscription accounts, using the sign-in da
 |-------------|--------------------------------------------------------------------------------------|----------------------------------------------|
 | Claude Code | Each account's `.credentials.json`, then its own Keychain entry (`Claude Code-credentials` for the default login, or a directory-specific entry for a custom config folder) | `api.anthropic.com/api/oauth/usage` |
 | Codex       | `~/.codex/auth.json` (or `$CODEX_HOME`), then Keychain `Codex Auth`                   | `chatgpt.com/backend-api/wham/usage`         |
-| Cursor      | Cursor's local `state.vscdb` (read-only)                                              | `cursor.com/api/usage-summary`               |
+| Cursor      | Cursor's local `state.vscdb` (read-only). Cursor 3 encrypts the token there; it is decrypted with the `Cursor Safe Storage` Keychain key, read only after you click **Allow Keychain Access** | `cursor.com/api/usage-summary`               |
 | Kiro CLI    | Kiro CLI's local `~/Library/Application Support/kiro-cli/data.sqlite3` (read-only)    | `q.<region>.amazonaws.com/getUsageLimits`    |
 
 - Kiro CLI's access token expires after about an hour. When it has expired, CodeBarAI runs `kiro-cli whoami` (at most once every 10 minutes) so the CLI renews and saves its own token. CodeBarAI never refreshes or writes Kiro's credentials itself.

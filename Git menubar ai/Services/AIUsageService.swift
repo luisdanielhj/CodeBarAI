@@ -2,6 +2,7 @@ import Foundation
 import Security
 import SQLite3
 import CryptoKit
+import CommonCrypto
 
 nonisolated enum AIUsageProvider: String, CaseIterable, Identifiable, Sendable {
     case claude, cursor, codex, kiro
@@ -142,6 +143,9 @@ nonisolated enum AIUsageError: Error, LocalizedError, Sendable {
     case signInRequired(AIUsageProvider)
     case credentialAccessDenied(AIUsageProvider)
     case expiredCredentials(AIUsageProvider)
+    /// The sign-in is encrypted with a Keychain key the user has not yet let
+    /// this app read. Only the user's click may open the macOS prompt.
+    case keychainApprovalRequired(AIUsageProvider)
     case missingScope
     case invalidResponse
     case networkUnavailable
@@ -164,6 +168,8 @@ nonisolated enum AIUsageError: Error, LocalizedError, Sendable {
             return "Could not read \(provider.title) credentials. Check local file permissions or allow this app access in Keychain Access, then retry. No credential prompt was opened."
         case .expiredCredentials(let provider):
             return "Your \(provider.title) session has expired. Sign in again in \(provider.title), then retry."
+        case .keychainApprovalRequired(let provider):
+            return "\(provider.title) encrypts its saved sign-in. Allow Keychain access so CodeBarAI can read it."
         case .missingScope:
             return "Claude Code credentials need the user:profile scope. Sign in again in Claude Code, then retry."
         case .invalidResponse:
@@ -194,9 +200,16 @@ nonisolated protocol AIUsageLoading: Sendable {
         claudeProfile: ClaudeAccountProfile?,
         requestID: String
     ) async throws -> AIUsageResetResult
+    /// Reads the Keychain key a provider's saved sign-in is encrypted with.
+    /// macOS may ask the user first, so call this only from a user action.
+    func allowKeychainAccess(for provider: AIUsageProvider) async throws
 }
 
 extension AIUsageLoading {
+    func allowKeychainAccess(for provider: AIUsageProvider) async throws {
+        throw AIUsageError.serviceUnavailable
+    }
+
     func redeemReset(
         _ credit: AIUsageResetCredit,
         provider: AIUsageProvider,
@@ -216,6 +229,9 @@ actor AIUsageService: AIUsageLoading {
     /// Last time `kiro-cli` was asked to renew its expired sign-in, so a
     /// broken login does not launch the CLI on every refresh.
     private var kiroRenewalAttemptedAt: Date?
+    /// AES key derived from Cursor's "Cursor Safe Storage" Keychain password.
+    /// Held in memory only, so the Keychain is read at most once per launch.
+    private var cursorStorageKey: Data?
 
     func load(_ provider: AIUsageProvider, claudeProfile: ClaudeAccountProfile? = nil) async throws -> AIUsageSnapshot {
         let profile = claudeProfile ?? .current()
@@ -403,7 +419,7 @@ actor AIUsageService: AIUsageLoading {
             return try codexRequest("https://chatgpt.com/backend-api/wham/usage")
         case .cursor:
             var request = try Self.usageRequest("https://cursor.com/api/usage-summary")
-            request.setValue(try cursorCookie(), forHTTPHeaderField: "Cookie")
+            request.setValue(try await cursorCookie(), forHTTPHeaderField: "Cookie")
             return request
         case .kiro:
             let credentials = try await kiroCredentials()
@@ -594,7 +610,32 @@ actor AIUsageService: AIUsageLoading {
         return data
     }
 
-    private func cursorCookie() throws -> String {
+    private func cursorCookie() async throws -> String {
+        let stored = try Self.cursorStoredAccessToken()
+        var token = stored
+        if stored.hasPrefix(Self.cursorEncryptedPrefix) {
+            let key = try await cursorSafeStorageKey(prompting: false)
+            guard let decrypted = Self.decryptCursorToken(stored, key: key) else {
+                // The key no longer opens the token, as after Cursor resets its storage.
+                cursorStorageKey = nil
+                throw AIUsageError.signInRequired(.cursor)
+            }
+            token = decrypted
+        }
+        guard let payload = Self.jwtPayload(token),
+              let subject = payload["sub"] as? String,
+              let user = subject.split(separator: "|", omittingEmptySubsequences: false).last.map(String.init),
+              Self.safeIdentifier(user),
+              let expiry = Self.epochDate(payload["exp"]) else {
+            throw AIUsageError.signInRequired(.cursor)
+        }
+        guard expiry > Date() else { throw AIUsageError.expiredCredentials(.cursor) }
+        return "WorkosCursorSessionToken=\(user)%3A%3A\(token)"
+    }
+
+    /// Cursor's saved access token: a JWT, or since Cursor 3 the same JWT
+    /// encrypted at rest (`cursor-safe-storage:v1:…`).
+    nonisolated private static func cursorStoredAccessToken() throws -> String {
         let path = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb").path
         var database: OpaquePointer?
@@ -629,16 +670,115 @@ actor AIUsageService: AIUsageLoading {
         let candidates = [String(data: data, encoding: .utf8), String(data: data, encoding: .utf16LittleEndian)]
         guard let token = candidates.compactMap({ $0 }).map({ value in
             value.trimmingCharacters(in: CharacterSet(charactersIn: "\u{FEFF}\0"))
-        }).first(where: { Self.jwtPayload($0) != nil }),
-              let payload = Self.jwtPayload(token),
-              let subject = payload["sub"] as? String,
-              let user = subject.split(separator: "|", omittingEmptySubsequences: false).last.map(String.init),
-              Self.safeIdentifier(user),
-              let expiry = Self.epochDate(payload["exp"]) else {
+        }).first(where: { Self.jwtPayload($0) != nil || $0.hasPrefix(cursorEncryptedPrefix) }) else {
             throw AIUsageError.signInRequired(.cursor)
         }
-        guard expiry > Date() else { throw AIUsageError.expiredCredentials(.cursor) }
-        return "WorkosCursorSessionToken=\(user)%3A%3A\(token)"
+        return token
+    }
+
+    // MARK: Cursor safe storage
+
+    nonisolated static let cursorEncryptedPrefix = "cursor-safe-storage:v1:"
+    nonisolated private static let cursorKeychainApprovedKey = "usage.cursor.keychainApproved"
+
+    /// Reads Cursor's "Cursor Safe Storage" password through `/usr/bin/security`,
+    /// like the Claude Keychain item. "Always Allow" then trusts that Apple
+    /// tool, so the approval survives updates of this app.
+    ///
+    /// The first read shows a macOS prompt, so it happens only with
+    /// `prompting`, from the user's click. Background refreshes read it only
+    /// after the user approved once, and stop if access is later refused.
+    private func cursorSafeStorageKey(prompting: Bool) async throws -> Data {
+        if let cursorStorageKey { return cursorStorageKey }
+        let defaults = UserDefaults.standard
+        guard prompting || defaults.bool(forKey: Self.cursorKeychainApprovedKey) else {
+            throw AIUsageError.keychainApprovalRequired(.cursor)
+        }
+        let output: ProcessOutput
+        do {
+            output = try await ProcessRunner.run(
+                executableURL: URL(fileURLWithPath: "/usr/bin/security"),
+                arguments: ["find-generic-password", "-s", "Cursor Safe Storage", "-a", "Cursor Key", "-w"],
+                // Leave time to answer the prompt.
+                timeout: prompting ? 120 : 10
+            )
+        } catch {
+            defaults.set(false, forKey: Self.cursorKeychainApprovedKey)
+            throw AIUsageError.keychainApprovalRequired(.cursor)
+        }
+        // 44 is errSecItemNotFound: Cursor has never saved an encrypted sign-in.
+        if output.exitCode == 44 { throw AIUsageError.signInRequired(.cursor) }
+        let password = output.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard output.isSuccess, !password.isEmpty, let key = Self.cursorKey(password: Data(password.utf8)) else {
+            defaults.set(false, forKey: Self.cursorKeychainApprovedKey)
+            throw AIUsageError.keychainApprovalRequired(.cursor)
+        }
+        cursorStorageKey = key
+        defaults.set(true, forKey: Self.cursorKeychainApprovedKey)
+        return key
+    }
+
+    func allowKeychainAccess(for provider: AIUsageProvider) async throws {
+        guard provider == .cursor else { throw AIUsageError.serviceUnavailable }
+        cursorStorageKey = nil
+        _ = try await cursorSafeStorageKey(prompting: true)
+    }
+
+    /// Electron's safeStorage key on macOS: PBKDF2-HMAC-SHA1 of the Keychain
+    /// password, salt "saltysalt", 1,003 rounds, 16 bytes.
+    nonisolated static func cursorKey(password: Data) -> Data? {
+        var key = Data(count: kCCKeySizeAES128)
+        let salt = Array("saltysalt".utf8)
+        let status = key.withUnsafeMutableBytes { keyBytes in
+            password.withUnsafeBytes { passwordBytes in
+                CCKeyDerivationPBKDF(
+                    CCPBKDFAlgorithm(kCCPBKDF2),
+                    passwordBytes.baseAddress?.assumingMemoryBound(to: CChar.self), password.count,
+                    salt, salt.count,
+                    CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA1), 1003,
+                    keyBytes.baseAddress?.assumingMemoryBound(to: UInt8.self), kCCKeySizeAES128
+                )
+            }
+        }
+        return status == kCCSuccess ? key : nil
+    }
+
+    /// Opens `cursor-safe-storage:v1:<base64>`, where the base64 holds
+    /// Electron's `v10` prefix and AES-128-CBC ciphertext with an IV of 16
+    /// spaces. Returns the JWT inside, or `nil` if it does not open.
+    nonisolated static func decryptCursorToken(_ value: String, key: Data) -> String? {
+        guard value.hasPrefix(cursorEncryptedPrefix), key.count == kCCKeySizeAES128 else { return nil }
+        var encoded = String(value.dropFirst(cursorEncryptedPrefix.count))
+        encoded += String(repeating: "=", count: (4 - encoded.count % 4) % 4)
+        guard let blob = Data(base64Encoded: encoded), blob.starts(with: Array("v10".utf8)) else { return nil }
+        let cipher = Data(blob.dropFirst(3))
+        guard !cipher.isEmpty, cipher.count % kCCBlockSizeAES128 == 0 else { return nil }
+
+        let iv = [UInt8](repeating: 0x20, count: kCCBlockSizeAES128)
+        var plain = Data(count: cipher.count)
+        var length = 0
+        let status = plain.withUnsafeMutableBytes { plainBytes in
+            cipher.withUnsafeBytes { cipherBytes in
+                key.withUnsafeBytes { keyBytes in
+                    CCCrypt(
+                        CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES), CCOptions(kCCOptionPKCS7Padding),
+                        keyBytes.baseAddress, key.count, iv,
+                        cipherBytes.baseAddress, cipher.count,
+                        plainBytes.baseAddress, cipher.count, &length
+                    )
+                }
+            }
+        }
+        guard status == kCCSuccess,
+              let text = String(data: plain.prefix(length), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"\0")))
+        else { return nil }
+        if jwtPayload(text) != nil { return text }
+        // Tolerate a wrapper around the token, such as JSON.
+        guard let range = text.range(of: #"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"#, options: .regularExpression)
+        else { return nil }
+        let token = String(text[range])
+        return jwtPayload(token) != nil ? token : nil
     }
 
     nonisolated struct KiroCredentials: Sendable {

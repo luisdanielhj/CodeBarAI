@@ -2,7 +2,7 @@ import Foundation
 
 /// Which coding tool a request came from.
 nonisolated enum UsageSource: String, Codable, Sendable, CaseIterable, Identifiable {
-    case claude, codex
+    case claude, codex, kiro
 
     var id: String { rawValue }
 
@@ -10,6 +10,7 @@ nonisolated enum UsageSource: String, Codable, Sendable, CaseIterable, Identifia
         switch self {
         case .claude: return "Claude Code"
         case .codex: return "Codex"
+        case .kiro: return "Kiro"
         }
     }
 
@@ -17,6 +18,7 @@ nonisolated enum UsageSource: String, Codable, Sendable, CaseIterable, Identifia
         switch self {
         case .claude: return .claude
         case .codex: return .codex
+        case .kiro: return .kiro
         }
     }
 }
@@ -61,6 +63,15 @@ nonisolated struct UsageEntry: Codable, Sendable {
     var tokens: TokenCounts
     /// Claude requests pinned to US-only inference cost 1.1x.
     var isUSOnly: Bool = false
+    /// Kiro bills each prompt in credits and logs no token counts. For Kiro,
+    /// `tokens` is an estimate.
+    var credits: Double?
+    /// Model requests behind this entry. Kiro logs one entry per prompt, which
+    /// can take many requests. `nil` means one.
+    var requestCount: Int?
+    /// Kiro only: what the estimated tokens would cost at API list prices.
+    /// `nil` when the model has no API price, as with Auto.
+    var estimatedAPICost: Double?
 }
 
 /// The rolling windows shown on the Cost and Tokens screens.
@@ -97,10 +108,21 @@ nonisolated struct UsageTotals: Sendable, Equatable {
     /// Tokens from models with no known API price, left out of `cost`.
     var unpricedTokens = 0
     var requests = 0
+    /// Kiro credits. Kiro's `cost` is its estimated API price, not credits.
+    var credits: Double = 0
+    /// Tokens estimated rather than counted, which is all of Kiro's.
+    var estimatedTokens = 0
+    /// Kiro credits whose model has no API price, left out of `cost`.
+    var creditsWithoutAPIPrice: Double = 0
 
     mutating func add(_ entry: UsageEntry, cost entryCost: Double?) {
         tokens += entry.tokens
-        requests += 1
+        requests += entry.requestCount ?? 1
+        if let entryCredits = entry.credits {
+            credits += entryCredits
+            estimatedTokens += entry.tokens.total
+            if entryCost == nil { creditsWithoutAPIPrice += entryCredits }
+        }
         if let entryCost { cost += entryCost } else { unpricedTokens += entry.tokens.total }
     }
 }
