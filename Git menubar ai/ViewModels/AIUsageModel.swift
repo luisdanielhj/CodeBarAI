@@ -5,9 +5,14 @@ import Observation
 final class AIUsageState: Identifiable {
     let provider: AIUsageProvider
     var claudeProfile: ClaudeAccountProfile?
-    var id: String { claudeProfile?.id ?? provider.id }
+    /// Set for every Kiro account. The default account keeps the plain `kiro`
+    /// ID, so its saved preferences carry over.
+    var kiroProfile: KiroAccountProfile?
+    var id: String { claudeProfile?.id ?? kiroProfile?.id ?? provider.id }
     var title: String {
-        claudeProfile.map { "Claude · \($0.name)" } ?? provider.title
+        if let claudeProfile { return "Claude · \(claudeProfile.name)" }
+        if let kiroProfile, !kiroProfile.isDefault { return "Kiro · \(kiroProfile.name)" }
+        return provider.title
     }
     var isInstalled: Bool
     var isEnabled: Bool
@@ -28,9 +33,16 @@ final class AIUsageState: Identifiable {
     /// cannot use a second reset.
     var pendingResetRequestIDs: [String: String] = [:]
 
-    init(provider: AIUsageProvider, isInstalled: Bool, isEnabled: Bool, claudeProfile: ClaudeAccountProfile? = nil) {
+    init(
+        provider: AIUsageProvider,
+        isInstalled: Bool,
+        isEnabled: Bool,
+        claudeProfile: ClaudeAccountProfile? = nil,
+        kiroProfile: KiroAccountProfile? = nil
+    ) {
         self.provider = provider
         self.claudeProfile = claudeProfile
+        self.kiroProfile = kiroProfile
         self.isInstalled = isInstalled
         self.isEnabled = isEnabled
     }
@@ -74,7 +86,8 @@ final class AIUsageModel {
                 provider: provider,
                 isInstalled: isInstalled,
                 isEnabled: isEnabled,
-                claudeProfile: provider == .claude ? .current(home: home, environment: environment) : nil
+                claudeProfile: provider == .claude ? .current(home: home, environment: environment) : nil,
+                kiroProfile: provider == .kiro ? .current(home: home) : nil
             )
         }
         let saved = defaults.data(forKey: "usage.claude.accounts")
@@ -83,6 +96,7 @@ final class AIUsageModel {
             appendClaudeAccount(profile)
         }
         discoverClaudeAccounts()
+        discoverKiroAccounts()
         if !claudeAccounts.contains(where: { $0.id == selectedClaudeAccountID }) {
             selectedClaudeAccountID = "claude"
         }
@@ -246,6 +260,27 @@ final class AIUsageModel {
         }
     }
 
+    var kiroAccounts: [AIUsageState] { states.filter { $0.provider == .kiro } }
+
+    /// Adds every `~/.kiro-*` account found. An account is enabled when the
+    /// default Kiro account is, until the user changes it.
+    func discoverKiroAccounts() {
+        var changed = false
+        for profile in KiroAccountProfile.discover(home: home)
+        where !kiroAccounts.contains(where: { $0.kiroProfile?.database == profile.database }) {
+            let key = "usage.enabled.\(profile.id)"
+            let enabled = defaults.object(forKey: key) == nil
+                ? (defaults.object(forKey: "usage.enabled.kiro") == nil || defaults.bool(forKey: "usage.enabled.kiro"))
+                : defaults.bool(forKey: key)
+            let state = AIUsageState(provider: .kiro, isInstalled: true, isEnabled: enabled, kiroProfile: profile)
+            defaults.set(enabled, forKey: key)
+            let insertionIndex = states.lastIndex { $0.provider == .kiro }.map { $0 + 1 } ?? states.endIndex
+            states.insert(state, at: insertionIndex)
+            changed = true
+        }
+        if changed { synchronizeMenuBarOrder() }
+    }
+
     func connect(_ state: AIUsageState) async {
         state.isEnabled = true
         defaults.set(true, forKey: "usage.enabled.\(state.id)")
@@ -347,6 +382,7 @@ final class AIUsageModel {
 
     func refreshAll() async {
         discoverClaudeAccounts()
+        discoverKiroAccounts()
         refreshInstalledProviders()
         await withTaskGroup(of: Void.self) { group in
             for state in states where state.isEnabled {
@@ -359,9 +395,14 @@ final class AIUsageModel {
 
     private func refreshInstalledProviders() {
         for state in states {
-            let isInstalled = state.claudeProfile.map {
-                FileManager.default.fileExists(atPath: $0.configDirectory.path) || state.provider.isInstalled
-            } ?? state.provider.isInstalled
+            let isInstalled: Bool
+            if let profile = state.claudeProfile {
+                isInstalled = FileManager.default.fileExists(atPath: profile.configDirectory.path) || state.provider.isInstalled
+            } else if let profile = state.kiroProfile, !profile.isDefault {
+                isInstalled = FileManager.default.fileExists(atPath: profile.database.path)
+            } else {
+                isInstalled = state.provider.isInstalled
+            }
             if state.isInstalled != isInstalled { state.isInstalled = isInstalled }
 
             let key = "usage.enabled.\(state.id)"
@@ -379,7 +420,11 @@ final class AIUsageModel {
             if state.generation == generation { state.isRefreshing = false }
         }
         do {
-            let snapshot = try await service.load(state.provider, claudeProfile: state.claudeProfile)
+            let snapshot = try await service.load(
+                state.provider,
+                claudeProfile: state.claudeProfile,
+                kiroProfile: state.kiroProfile
+            )
             guard state.isEnabled, state.generation == generation else { return }
             state.snapshot = snapshot
             state.failure = nil

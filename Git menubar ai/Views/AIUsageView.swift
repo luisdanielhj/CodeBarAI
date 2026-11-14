@@ -224,7 +224,7 @@ private struct ProviderLimitsSection: View {
             Text(state.title)
                 .font(.system(size: 12, weight: .semibold))
                 .lineLimit(1)
-                .help(state.claudeProfile?.configDirectory.path ?? state.provider.title)
+                .help(state.claudeProfile?.configDirectory.path ?? state.kiroProfile?.database.path ?? state.provider.title)
             if let plan = state.snapshot?.plan {
                 Text(plan.capitalized)
                     .font(.system(size: 10.5))

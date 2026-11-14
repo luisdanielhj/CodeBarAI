@@ -102,6 +102,18 @@ Click **Organize Menu Bar…** above the usage cards to show several accounts at
 
 Choosing an account starts Claude with that account's config and Keychain location, clearing inherited API keys, bearer/OAuth tokens, and cloud-provider switches for that new process. Account-specific and managed Claude settings still apply.
 
+### Using multiple Kiro accounts
+
+Kiro CLI keeps its sign-in in one database. A second account uses its own database through `KIRO_TEST_DB_PATH`, an undocumented Kiro CLI setting that a future release could change. A wrapper script such as `~/.local/bin/kiro-cli-2` keeps it separate:
+
+```bash
+#!/bin/sh
+export KIRO_TEST_DB_PATH="$HOME/.kiro-account-2/data.sqlite3"
+exec "$HOME/.local/bin/kiro-cli" "$@"
+```
+
+Sign in with `kiro-cli-2 login`. CodeBarAI discovers `~/.kiro-*` folders containing a `data.sqlite3` and shows each as its own **Kiro · Name** card, named after the folder. Cost and tokens on the cost screens still combine all Kiro accounts, because they share `~/.kiro`.
+
 ## Permissions
 
 CodeBarAI is **not sandboxed**, because it needs to run `git` and read your AI tools' local sign-in data. macOS may ask you for:

@@ -192,6 +192,13 @@ nonisolated enum AIUsageError: Error, LocalizedError, Sendable {
 
 nonisolated protocol AIUsageLoading: Sendable {
     func load(_ provider: AIUsageProvider, claudeProfile: ClaudeAccountProfile?) async throws -> AIUsageSnapshot
+    /// Loads one Kiro account. Defaults to the single-account load, which
+    /// reads Kiro CLI's default sign-in.
+    func load(
+        _ provider: AIUsageProvider,
+        claudeProfile: ClaudeAccountProfile?,
+        kiroProfile: KiroAccountProfile?
+    ) async throws -> AIUsageSnapshot
     /// Uses one saved reset. `requestID` makes a retry of the same attempt
     /// safe: the provider redeems at most one reset per ID.
     func redeemReset(
@@ -206,6 +213,14 @@ nonisolated protocol AIUsageLoading: Sendable {
 }
 
 extension AIUsageLoading {
+    func load(
+        _ provider: AIUsageProvider,
+        claudeProfile: ClaudeAccountProfile?,
+        kiroProfile: KiroAccountProfile?
+    ) async throws -> AIUsageSnapshot {
+        try await load(provider, claudeProfile: claudeProfile)
+    }
+
     func allowKeychainAccess(for provider: AIUsageProvider) async throws {
         throw AIUsageError.serviceUnavailable
     }
@@ -226,16 +241,27 @@ actor AIUsageService: AIUsageLoading {
     private var claudeCache: [String: (token: String, expiresAt: Date?)] = [:]
     /// Organization IDs by account, needed to claim a Claude reset.
     private var claudeOrganizations: [String: String] = [:]
-    /// Last time `kiro-cli` was asked to renew its expired sign-in, so a
-    /// broken login does not launch the CLI on every refresh.
-    private var kiroRenewalAttemptedAt: Date?
+    /// Last time `kiro-cli` was asked to renew each account's expired
+    /// sign-in, so a broken login does not launch the CLI on every refresh.
+    private var kiroRenewalAttemptedAt: [String: Date] = [:]
     /// AES key derived from Cursor's "Cursor Safe Storage" Keychain password.
     /// Held in memory only, so the Keychain is read at most once per launch.
     private var cursorStorageKey: Data?
 
     func load(_ provider: AIUsageProvider, claudeProfile: ClaudeAccountProfile? = nil) async throws -> AIUsageSnapshot {
+        try await load(provider, claudeProfile: claudeProfile, kiroProfile: nil)
+    }
+
+    func load(
+        _ provider: AIUsageProvider,
+        claudeProfile: ClaudeAccountProfile?,
+        kiroProfile: KiroAccountProfile?
+    ) async throws -> AIUsageSnapshot {
         let profile = claudeProfile ?? .current()
-        let request = try await mapErrors { try await self.makeRequest(for: provider, claudeProfile: profile) }
+        let kiroProfile = kiroProfile ?? .current()
+        let request = try await mapErrors {
+            try await self.makeRequest(for: provider, claudeProfile: profile, kiroProfile: kiroProfile)
+        }
         let data = try await send(request, provider: provider, claudeProfile: profile)
         var snapshot = try Self.parse(data, for: provider)
         // Codex lists reset details separately. Ask only when the usage
@@ -410,7 +436,11 @@ actor AIUsageService: AIUsageLoading {
         }
     }
 
-    private func makeRequest(for provider: AIUsageProvider, claudeProfile: ClaudeAccountProfile) async throws -> URLRequest {
+    private func makeRequest(
+        for provider: AIUsageProvider,
+        claudeProfile: ClaudeAccountProfile,
+        kiroProfile: KiroAccountProfile
+    ) async throws -> URLRequest {
         switch provider {
         case .claude:
             // `cedar_ember=1` adds the account's saved limit resets.
@@ -422,7 +452,7 @@ actor AIUsageService: AIUsageLoading {
             request.setValue(try await cursorCookie(), forHTTPHeaderField: "Cookie")
             return request
         case .kiro:
-            let credentials = try await kiroCredentials()
+            let credentials = try await kiroCredentials(for: kiroProfile)
             var components = URLComponents()
             components.scheme = "https"
             components.host = "q.\(credentials.region).amazonaws.com"
@@ -792,21 +822,25 @@ actor AIUsageService: AIUsageLoading {
     /// it runs. Renewal is left to the CLI: refreshing here would rotate the
     /// refresh token behind its back and sign it out. `kiro-cli whoami` loads
     /// the saved login, which renews and saves an expired token.
-    private func kiroCredentials() async throws -> KiroCredentials {
-        let database = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/kiro-cli/data.sqlite3")
+    /// A second account is renewed by pointing the CLI at its own database,
+    /// never at the default one.
+    private func kiroCredentials(for profile: KiroAccountProfile) async throws -> KiroCredentials {
+        let database = profile.database
         let credentials = try Self.readKiroCredentials(database: database)
         if credentials.expiresAt.map({ $0 > Date().addingTimeInterval(60) }) ?? true {
             return credentials
         }
-        guard kiroRenewalAttemptedAt.map({ Date().timeIntervalSince($0) > 600 }) ?? true,
+        guard kiroRenewalAttemptedAt[profile.id].map({ Date().timeIntervalSince($0) > 600 }) ?? true,
               let executable = Self.kiroExecutable() else {
             throw AIUsageError.expiredCredentials(.kiro)
         }
-        kiroRenewalAttemptedAt = Date()
+        kiroRenewalAttemptedAt[profile.id] = Date()
         _ = try? await ProcessRunner.run(
             executableURL: executable,
             arguments: ["whoami", "--format", "json"],
+            environment: profile.environment.isEmpty
+                ? nil
+                : ProcessInfo.processInfo.environment.merging(profile.environment) { $1 },
             timeout: 20
         )
         let renewed = try Self.readKiroCredentials(database: database)

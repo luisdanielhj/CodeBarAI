@@ -17,7 +17,8 @@ nonisolated struct ClaudeAccountsTests {
         try await disconnectedMigration(in: root)
         try await inFlightRemoval(in: root)
         try await launchSelection(in: root)
-        print("PASS: account identity, scoped credentials, discovery, persistence, menu bar visibility/order/migration, independent usage/backoff, disconnect, in-flight removal, and shell account selection")
+        try await kiroAccounts(in: root)
+        print("PASS: Kiro accounts; account identity, scoped credentials, discovery, persistence, menu bar visibility/order/migration, independent usage/backoff, disconnect, in-flight removal, and shell account selection")
     }
 
     static func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
@@ -260,6 +261,63 @@ printf '%s\n%s\n' "${CLAUDE_CONFIG_DIR-UNSET}" "${CLAUDE_SECURESTORAGE_CONFIG_DI
     }
 }
 
+extension ClaudeAccountsTests {
+    /// Each Kiro account reads its own sign-in database and keeps its own card.
+    static func kiroAccounts(in root: URL) async throws {
+        let home = root.appendingPathComponent("kiro-home")
+        let second = home.appendingPathComponent(".kiro-account-2")
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+        // Kiro's settings folder and a folder without a database are not accounts.
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".kiro"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".kiro-backup"), withIntermediateDirectories: true)
+        let defaultDirectory = home.appendingPathComponent("Library/Application Support/kiro-cli")
+        try FileManager.default.createDirectory(at: defaultDirectory, withIntermediateDirectories: true)
+        try makeKiroDatabase(defaultDirectory.appendingPathComponent("data.sqlite3"), token: "aoaDefaultToken")
+        try makeKiroDatabase(second.appendingPathComponent("data.sqlite3"), token: "aoaSecondToken")
+
+        let original = KiroAccountProfile.current(home: home)
+        expect(original.id == "kiro" && original.environment.isEmpty, "The default account keeps its preference ID and the CLI's own lookup")
+        let discovered = KiroAccountProfile.discover(home: home)
+        expect(discovered.count == 1 && discovered[0].name == "Account 2", "Discover only ~/.kiro-* folders with a sign-in database")
+        let profile = discovered[0]
+        expect(profile.environment == ["KIRO_TEST_DB_PATH": second.appendingPathComponent("data.sqlite3").path], "Point kiro-cli at the account's own database")
+        expect(KiroAccountProfile(directory: home.appendingPathComponent("x/../.kiro-account-2/")).id == profile.id, "Equivalent paths must not duplicate accounts")
+
+        let defaultLogin = try AIUsageService.readKiroCredentials(database: original.database)
+        let secondLogin = try AIUsageService.readKiroCredentials(database: profile.database)
+        expect(defaultLogin.token == "aoaDefaultToken" && secondLogin.token == "aoaSecondToken", "Each account reads only its own sign-in")
+
+        let (defaults, suite) = testDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let service = FakeUsageService()
+        let model = AIUsageModel(defaults: defaults, service: service, home: home, environment: [:])
+        expect(model.kiroAccounts.map(\.id) == ["kiro", profile.id], "List the default Kiro account first, then each extra account")
+        expect(model.kiroAccounts[1].title == "Kiro · Account 2", "Name extra accounts after their folder")
+        model.discoverKiroAccounts()
+        expect(model.kiroAccounts.count == 2, "Rediscovery must not duplicate accounts")
+        expect(model.menuBarAccountOrder.contains(profile.id), "New accounts can be organized in the menu bar")
+        let extra = model.kiroAccounts[1]
+        expect(!extra.isEnabled, "A new account follows the default Kiro account's connection")
+        await model.refreshAll()
+        expect(!extra.isEnabled, "Refreshing must not connect an account the user left off")
+        await model.connect(extra)
+        expect(extra.snapshot?.plan == "Account 2", "Second account usage stays on its card")
+        let extraCalls = await service.callCount(for: profile.id)
+        expect(extraCalls == 1, "Load the second account with its own profile")
+    }
+
+    static func makeKiroDatabase(_ url: URL, token: String) throws {
+        let expiry = ISO8601DateFormatter().string(from: Date().addingTimeInterval(3_600))
+        let value = #"{"access_token":"\#(token)","expires_at":"\#(expiry)","region":"us-east-1"}"#
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        process.arguments = [url.path, "CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value BLOB); CREATE TABLE state (key TEXT PRIMARY KEY, value BLOB); INSERT INTO auth_kv VALUES ('kirocli:odic:token', CAST('\(value)' AS BLOB));"]
+        try process.run()
+        process.waitUntilExit()
+        expect(process.terminationStatus == 0, "Create a synthetic Kiro database")
+    }
+}
+
 actor FakeUsageService: AIUsageLoading {
     private var calls: [String: Int] = [:]
     private var failures: [String: Date] = [:]
@@ -269,6 +327,19 @@ actor FakeUsageService: AIUsageLoading {
         calls[id, default: 0] += 1
         if let retry = failures[id] { throw AIUsageError.rateLimited(retry) }
         return AIUsageSnapshot(plan: claudeProfile?.name, windows: [], fetchedAt: Date())
+    }
+
+    func load(
+        _ provider: AIUsageProvider,
+        claudeProfile: ClaudeAccountProfile?,
+        kiroProfile: KiroAccountProfile?
+    ) async throws -> AIUsageSnapshot {
+        guard let kiroProfile, !kiroProfile.isDefault else {
+            return try await load(provider, claudeProfile: claudeProfile)
+        }
+        calls[kiroProfile.id, default: 0] += 1
+        if let retry = failures[kiroProfile.id] { throw AIUsageError.rateLimited(retry) }
+        return AIUsageSnapshot(plan: kiroProfile.name, windows: [], fetchedAt: Date())
     }
 
     func fail(_ id: String, until retry: Date) { failures[id] = retry }
