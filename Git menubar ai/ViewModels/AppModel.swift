@@ -35,6 +35,7 @@ final class AppModel {
 
     let usage = AIUsageModel()
     let servers = RunningServersModel()
+    let deployments = VercelDeploymentsModel()
     let tokens = TokenUsageModel()
     let commitAI = CommitAISettingsModel()
 

@@ -1,11 +1,13 @@
 import AppKit
 import SwiftUI
 
-/// Settings for the AI that writes commit messages: provider, API key, model.
+/// Settings for the AI that writes commit messages (provider, API key, model)
+/// and the optional Vercel token for the Deploys tab.
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     let maxHeight: CGFloat
     @State private var keyDraft = ""
+    @State private var vercelTokenDraft = ""
 
     private var settings: CommitAISettingsModel { model.commitAI }
 
@@ -26,11 +28,14 @@ struct SettingsView: View {
                         appleSection
                     }
                     descriptionToggle
+                    Divider().opacity(0.5)
+                    vercelSection
                 }
                 .padding(Theme.edge)
             }
         }
         .task { await settings.loadKeyStatus() }
+        .task { await model.deployments.loadTokenStatus() }
         .onChange(of: settings.provider) { keyDraft = "" }
     }
 
@@ -45,7 +50,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Settings")
                     .font(.system(size: 13, weight: .semibold))
-                Text("Commit messages")
+                Text("Commit messages and Vercel")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
             }
@@ -252,5 +257,117 @@ struct SettingsView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .card()
+    }
+
+    // MARK: Vercel
+
+    private var vercelSection: some View {
+        let deployments = model.deployments
+        return VStack(alignment: .leading, spacing: 8) {
+            SectionHeader(title: "Vercel token") {
+                Link("Create a token", destination: URL(string: "https://vercel.com/account/settings/tokens")!)
+                    .font(.system(size: 11, weight: .medium))
+            }
+
+            switch deployments.tokenStatus {
+            case .saved(let suffix):
+                savedVercelTokenRow(suffix: suffix)
+            case .missing:
+                vercelTokenEntry
+            case .unknown:
+                HStack { Spacer(); InlineSpinner(); Spacer() }
+            }
+
+            if let error = deployments.tokenError {
+                InlineBanner(kind: .error, title: "Something went wrong", detail: error) {
+                    deployments.tokenError = nil
+                }
+            }
+
+            Text(vercelNote)
+                .font(.system(size: 10.5))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var vercelNote: String {
+        if case .saved = model.deployments.tokenStatus {
+            return "The Deploys tab uses this token to read your teams and deployments. Remove it to use your Vercel CLI login instead."
+        }
+        return VercelCredentials.hasCLILogin
+            ? "Optional. The Deploys tab already uses your Vercel CLI login. A token here takes its place."
+            : "The Deploys tab needs this token, or a Vercel CLI login (vercel login in Terminal), to read your deployments."
+    }
+
+    private func savedVercelTokenRow(suffix: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "key.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(.green)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Saved in your keychain")
+                    .font(.system(size: 12, weight: .medium))
+                Text("Ends in …\(suffix)")
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            if model.deployments.isSavingToken {
+                InlineSpinner()
+            } else {
+                Button("Remove") {
+                    Task { await model.deployments.removeToken() }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.red)
+                .help("Delete this token from your keychain")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .card()
+    }
+
+    private var vercelTokenEntry: some View {
+        let trimmed = vercelTokenDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isSaving = model.deployments.isSavingToken
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 4) {
+                SecureField("Vercel access token", text: $vercelTokenDraft)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12, design: .monospaced))
+                    .onSubmit(saveVercelToken)
+                IconButton(systemImage: "doc.on.clipboard", help: "Paste from the clipboard") {
+                    if let text = NSPasteboard.general.string(forType: .string) {
+                        vercelTokenDraft = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                }
+            }
+            .padding(.leading, 10)
+            .padding(.trailing, 3)
+            .frame(height: 30)
+            .card()
+
+            WideButton(
+                title: isSaving ? "Checking token…" : "Save Token",
+                systemImage: "key",
+                style: .primary,
+                isWorking: isSaving
+            ) {
+                saveVercelToken()
+            }
+            .disabled(trimmed.isEmpty || isSaving)
+        }
+    }
+
+    private func saveVercelToken() {
+        let draft = vercelTokenDraft
+        Task {
+            if await model.deployments.saveToken(draft) {
+                vercelTokenDraft = ""
+            }
+        }
     }
 }

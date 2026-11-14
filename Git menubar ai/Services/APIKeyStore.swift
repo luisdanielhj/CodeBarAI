@@ -1,6 +1,6 @@
 import Foundation
 
-/// Stores AI provider API keys in the login keychain.
+/// Stores AI provider API keys and the Vercel token in the login keychain.
 ///
 /// Items are written and read through `/usr/bin/security`, the same way the
 /// app reads Claude Code's credentials. An item created by that tool trusts
@@ -12,19 +12,49 @@ import Foundation
 /// in the process list.
 nonisolated enum APIKeyStore {
     private static let service = "CodeBarAI AI Provider Key"
+    private static let vercelService = "CodeBarAI Vercel Token"
+    private static let vercelAccount = "vercel"
     private static let tool = URL(filePath: "/usr/bin/security")
     /// `errSecItemNotFound` as `security`'s exit status.
     private static let notFoundExitCode: Int32 = 44
 
     static func key(for provider: CommitAIProvider) async throws -> String? {
-        let output = try await run(["find-generic-password", "-s", service, "-a", provider.rawValue, "-w"])
+        try await key(service: service, account: provider.rawValue)
+    }
+
+    static func save(_ key: String, for provider: CommitAIProvider) async throws {
+        try await save(key, service: service, account: provider.rawValue, label: "CodeBarAI \(provider.title) API key")
+    }
+
+    static func delete(for provider: CommitAIProvider) async throws {
+        try await delete(service: service, account: provider.rawValue)
+    }
+
+    // MARK: Vercel
+
+    static func vercelToken() async throws -> String? {
+        try await key(service: vercelService, account: vercelAccount)
+    }
+
+    static func saveVercelToken(_ token: String) async throws {
+        try await save(token, service: vercelService, account: vercelAccount, label: "CodeBarAI Vercel token")
+    }
+
+    static func deleteVercelToken() async throws {
+        try await delete(service: vercelService, account: vercelAccount)
+    }
+
+    // MARK: Items
+
+    private static func key(service: String, account: String) async throws -> String? {
+        let output = try await run(["find-generic-password", "-s", service, "-a", account, "-w"])
         if output.exitCode == notFoundExitCode { return nil }
         guard output.isSuccess else { throw APIKeyStoreError.readFailed(output.diagnostics) }
         let key = output.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
         return key.isEmpty ? nil : key
     }
 
-    static func save(_ key: String, for provider: CommitAIProvider) async throws {
+    private static func save(_ key: String, service: String, account: String, label: String) async throws {
         guard !key.isEmpty, !key.contains(where: \.isNewline) else {
             throw APIKeyStoreError.invalidKey
         }
@@ -35,8 +65,8 @@ nonisolated enum APIKeyStore {
             [
                 "add-generic-password", "-U",
                 "-s", service,
-                "-a", provider.rawValue,
-                "-l", "CodeBarAI \(provider.title) API key",
+                "-a", account,
+                "-l", label,
                 "-w"
             ],
             input: input
@@ -44,8 +74,8 @@ nonisolated enum APIKeyStore {
         guard output.isSuccess else { throw APIKeyStoreError.writeFailed(output.diagnostics) }
     }
 
-    static func delete(for provider: CommitAIProvider) async throws {
-        let output = try await run(["delete-generic-password", "-s", service, "-a", provider.rawValue])
+    private static func delete(service: String, account: String) async throws {
+        let output = try await run(["delete-generic-password", "-s", service, "-a", account])
         guard output.isSuccess || output.exitCode == notFoundExitCode else {
             throw APIKeyStoreError.writeFailed(output.diagnostics)
         }

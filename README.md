@@ -34,6 +34,13 @@ A macOS menu bar app for developers who work with AI coding tools. It shows how 
 - **Stop** sends a graceful termination request to that server job. **Force Stop** becomes available if it does not shut down. Other terminal jobs and other users' processes are excluded from termination.
 - The **⋯** menu opens a local server in your browser or reveals its project folder. The list refreshes every five seconds while the section is active.
 
+### Vercel deployments
+- The **Deploys** tab shows the latest deployment of each Vercel project across all your teams: status (ready, building, queued, failed, canceled), production or preview, branch, commit message and age.
+- It uses your **Vercel CLI login** (`vercel login`) with no setup, and renews the CLI's short-lived token by running `vercel whoami` when it expires. You can instead save an access token in **Settings**; it's kept in your keychain and only sent to `api.vercel.com`.
+- The tab badge counts builds in progress. The list refreshes every 10 seconds while something is building and every minute otherwise, only while the tab is open.
+- **Choose Teams…** in the tab's **⋯** menu lets you check which teams to show. Your choice is saved, and teams you join later are shown until you uncheck them.
+- Open a deployment, open it in the Vercel dashboard, or copy its URL from the **⋯** menu.
+
 ### Commit message generation
 - Writes a [Conventional Commit](https://www.conventionalcommits.org/) subject line (`type(scope): summary`) from the changed files and a short excerpt of the diff.
 - Uses **Apple Foundation Models** (Apple Intelligence) when it's available. Otherwise it falls back to a local heuristic based on file paths, branch names and diff stats.

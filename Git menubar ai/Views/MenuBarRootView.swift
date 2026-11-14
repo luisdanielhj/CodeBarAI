@@ -1,9 +1,9 @@
 import AppKit
 import SwiftUI
 
-/// The three sections of the menu bar window.
+/// The sections of the menu bar window.
 enum MenuTab: String, CaseIterable, Identifiable {
-    case projects, limits, servers
+    case projects, limits, servers, deployments
 
     var id: Self { self }
 
@@ -12,6 +12,7 @@ enum MenuTab: String, CaseIterable, Identifiable {
         case .projects: return "Projects"
         case .limits: return "Usage"
         case .servers: return "Servers"
+        case .deployments: return "Deploys"
         }
     }
 }
@@ -24,6 +25,7 @@ struct MenuBarRootView: View {
     @AppStorage("ui.selectedTab") private var tab: MenuTab = .projects
     @AppStorage("ui.usageSection") private var usageSection: UsageSection = .limits
     @State private var organizingMenuBar = false
+    @State private var choosingDeploymentTeams = false
 
     /// Backstop poll interval. File system events handle everything local; this
     /// only catches state changed by other tools in ways FSEvents misses.
@@ -76,7 +78,10 @@ struct MenuBarRootView: View {
                 await model.refreshAll()
             }
         }
-        .onChange(of: tab) { organizingMenuBar = false }
+        .onChange(of: tab) {
+            organizingMenuBar = false
+            choosingDeploymentTeams = false
+        }
     }
 
     // MARK: Header
@@ -104,6 +109,10 @@ struct MenuBarRootView: View {
             return count > 0 ? "\(count)" : nil
         case .servers:
             let count = model.servers.servers.count
+            return count > 0 ? "\(count)" : nil
+        case .deployments:
+            // Builds in progress, so a finished one is noticeable without opening the tab.
+            let count = model.deployments.inProgressCount
             return count > 0 ? "\(count)" : nil
         case .limits:
             return nil
@@ -156,6 +165,26 @@ struct MenuBarRootView: View {
                     Task { await model.servers.refresh(projects: model.repositories.map(\.repository)) }
                 }
             }
+        case .deployments where choosingDeploymentTeams:
+            Button("Done") { choosingDeploymentTeams = false }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+                .padding(.horizontal, 6)
+        case .deployments:
+            if model.deployments.isRefreshing {
+                InlineSpinner()
+            } else {
+                IconButton(systemImage: "arrow.clockwise", help: "Refresh deployments") {
+                    Task { await model.deployments.refresh() }
+                }
+            }
+            IconMenu(help: "Deployments options") {
+                Button("Choose Teams…") { choosingDeploymentTeams = true }
+                Button("Open Vercel Dashboard") {
+                    NSWorkspace.shared.open(URL(string: "https://vercel.com/dashboard")!)
+                }
+            }
         }
     }
 
@@ -174,6 +203,14 @@ struct MenuBarRootView: View {
                 projects: model.repositories.map(\.repository),
                 maxHeight: contentMaxHeight
             )
+        case .deployments:
+            DeploymentsView(
+                model: model.deployments,
+                maxHeight: contentMaxHeight,
+                choosingTeams: $choosingDeploymentTeams
+            ) {
+                withAnimation(.snappy(duration: 0.2)) { model.isShowingSettings = true }
+            }
         }
     }
 
@@ -241,6 +278,29 @@ struct MenuBarRootView: View {
         case .servers:
             let count = model.servers.servers.count
             Text(count == 0 ? "Checks every 5 seconds while open" : "\(count) running")
+        case .deployments:
+            deploymentsSummary
+        }
+    }
+
+    @ViewBuilder
+    private var deploymentsSummary: some View {
+        let deployments = model.deployments
+        let building = deployments.inProgressCount
+        let failed = deployments.failedCount
+        if building > 0 || failed > 0 {
+            Text(
+                [
+                    building > 0 ? "\(building) building" : nil,
+                    failed > 0 ? "\(failed) failed" : nil
+                ].compactMap { $0 }.joined(separator: " · ")
+            )
+        } else if let updated = deployments.lastUpdated, !deployments.deployments.isEmpty {
+            TimelineView(.periodic(from: .now, by: 30)) { _ in
+                Text("All ready · updated \(updated, format: .relative(presentation: .named))")
+            }
+        } else {
+            Text("Latest deployment of each Vercel project")
         }
     }
 }

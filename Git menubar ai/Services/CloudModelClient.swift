@@ -244,7 +244,8 @@ nonisolated enum CloudModelClient {
     }
 }
 
-private nonisolated final class RefuseRedirects: NSObject, URLSessionTaskDelegate, Sendable {
+/// Keeps a bearer token from following a redirect to another host.
+nonisolated final class RefuseRedirects: NSObject, URLSessionTaskDelegate, Sendable {
     func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
