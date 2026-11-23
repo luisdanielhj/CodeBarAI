@@ -20,6 +20,10 @@ nonisolated struct GitClient: Sendable {
         environment["GIT_TERMINAL_PROMPT"] = "0"
         environment["GIT_ASKPASS"] = "/usr/bin/false"
         environment["SSH_ASKPASS_REQUIRE"] = "never"
+        // Continuing a merge or rebase would otherwise open an editor for the
+        // message. `true` accepts the message git prepared.
+        environment["GIT_EDITOR"] = "true"
+        environment["GIT_MERGE_AUTOEDIT"] = "no"
         if environment["GIT_SSH_COMMAND"] == nil {
             environment["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=10"
         }
@@ -77,6 +81,35 @@ nonisolated struct GitClient: Sendable {
         return output.standardOutput
     }
 
+    /// Like `runChecked`, but returns both streams of a successful run, for
+    /// commands that report important outcomes on stderr (an autostash that
+    /// could not be reapplied, for example).
+    private func runReporting(
+        _ arguments: [String],
+        label: String,
+        in repository: URL?,
+        timeout: TimeInterval
+    ) async throws -> String {
+        let output: ProcessOutput
+        do {
+            output = try await run(arguments, in: repository, timeout: timeout)
+        } catch {
+            throw GitFailure(command: label, exitCode: -1, message: error.localizedDescription)
+        }
+        let combined = [output.standardOutput, output.standardError]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+        guard output.isSuccess else {
+            throw GitFailure(
+                command: label,
+                exitCode: output.exitCode,
+                message: combined.isEmpty ? "git exited with code \(output.exitCode)." : combined
+            )
+        }
+        return combined
+    }
+
     // MARK: - Discovery
 
     /// Confirms the system git is usable, returning its version string.
@@ -113,7 +146,7 @@ nonisolated struct GitClient: Sendable {
             [
                 "--no-optional-locks",
                 "-c", "core.quotepath=false",
-                "status", "--porcelain=v2", "--branch", "--untracked-files=all", "-z"
+                "status", "--porcelain=v2", "--branch", "--show-stash", "--untracked-files=all", "-z"
             ],
             label: "git status",
             in: url,
@@ -122,7 +155,7 @@ nonisolated struct GitClient: Sendable {
 
         let remotes = try await remoteNames(at: url)
         let operation = await operationInProgress(at: url)
-        return Self.parseStatus(raw, remotes: remotes, operationInProgress: operation)
+        return Self.parseStatus(raw, remotes: remotes, operation: operation)
     }
 
     private func remoteNames(at url: URL) async throws -> [String] {
@@ -134,7 +167,7 @@ nonisolated struct GitClient: Sendable {
 
     /// Detects an interrupted merge, rebase, cherry-pick or revert from the marker
     /// files git leaves in the git directory.
-    private func operationInProgress(at url: URL) async -> String? {
+    private func operationInProgress(at url: URL) async -> GitOperation? {
         guard
             let raw = try? await runChecked(
                 ["rev-parse", "--absolute-git-dir"],
@@ -150,10 +183,10 @@ nonisolated struct GitClient: Sendable {
             fileManager.fileExists(atPath: gitDirectory.appending(path: name).path)
         }
 
-        if exists("rebase-merge") || exists("rebase-apply") { return "A rebase" }
-        if exists("MERGE_HEAD") { return "A merge" }
-        if exists("CHERRY_PICK_HEAD") { return "A cherry-pick" }
-        if exists("REVERT_HEAD") { return "A revert" }
+        if exists("rebase-merge") || exists("rebase-apply") { return .rebase }
+        if exists("MERGE_HEAD") { return .merge }
+        if exists("CHERRY_PICK_HEAD") { return .cherryPick }
+        if exists("REVERT_HEAD") { return .revert }
         return nil
     }
 
@@ -334,7 +367,263 @@ nonisolated struct GitClient: Sendable {
         )
     }
 
+    // MARK: - Syncing with the remote
+
+    /// `git fetch --all --prune`: learns about commits pushed from other
+    /// machines without touching the worktree.
+    func fetch(at url: URL) async throws {
+        try await runChecked(
+            ["fetch", "--all", "--prune", "--quiet"],
+            label: "git fetch",
+            in: url,
+            timeout: Self.networkTimeout
+        )
+    }
+
+    /// `git pull` with the chosen strategy. Returns git's output so the caller
+    /// can notice an autostash that had to stay in the stash.
+    @discardableResult
+    func pull(at url: URL, strategy: PullStrategy) async throws -> String {
+        try await runReporting(
+            strategy.pullArguments,
+            label: "git pull",
+            in: url,
+            timeout: Self.networkTimeout
+        )
+    }
+
+    /// `git merge --ff-only @{upstream}` against what the last fetch brought
+    /// in. Git refuses, changing nothing, when a local edit touches a file
+    /// the incoming commits also change, so it is safe to run unattended.
+    func fastForward(at url: URL) async throws {
+        try await runChecked(
+            ["merge", "--ff-only", "--quiet", "@{upstream}"],
+            label: "git merge --ff-only",
+            in: url,
+            timeout: Self.localWriteTimeout
+        )
+    }
+
+    /// Commits on the upstream that HEAD doesn't have yet.
+    func incomingCommits(at url: URL, limit: Int = 50) async throws -> [GitCommitSummary] {
+        try await commits(at: url, range: "HEAD..@{upstream}", limit: limit)
+    }
+
+    /// Commits on HEAD that haven't been pushed to the upstream.
+    func outgoingCommits(at url: URL, limit: Int = 50) async throws -> [GitCommitSummary] {
+        try await commits(at: url, range: "@{upstream}..HEAD", limit: limit)
+    }
+
+    private func commits(at url: URL, range: String, limit: Int) async throws -> [GitCommitSummary] {
+        let raw = try await runChecked(
+            ["log", "--no-color", "-n", String(limit), "--format=%H%x1f%h%x1f%s%x1f%an%x1f%ct%x1e", range, "--"],
+            label: "git log",
+            in: url,
+            timeout: Self.statusTimeout
+        )
+        return Self.parseLog(raw)
+    }
+
+    // MARK: - Interrupted operations
+
+    /// `git <operation> --continue`, once every conflict is resolved.
+    func continueOperation(_ operation: GitOperation, at url: URL) async throws {
+        try await runChecked(
+            ["-c", "core.editor=true", operation.subcommand, "--continue"],
+            label: "git \(operation.subcommand) --continue",
+            in: url,
+            timeout: Self.localWriteTimeout
+        )
+    }
+
+    /// `git <operation> --abort`: back to where things were before it started.
+    func abortOperation(_ operation: GitOperation, at url: URL) async throws {
+        try await runChecked(
+            [operation.subcommand, "--abort"],
+            label: "git \(operation.subcommand) --abort",
+            in: url,
+            timeout: Self.localWriteTimeout
+        )
+    }
+
+    /// `git <operation> --skip`: drops the commit that is being applied.
+    func skipCommit(_ operation: GitOperation, at url: URL) async throws {
+        try await runChecked(
+            [operation.subcommand, "--skip"],
+            label: "git \(operation.subcommand) --skip",
+            in: url,
+            timeout: Self.localWriteTimeout
+        )
+    }
+
+    /// Resolves a conflicted file by keeping one whole side, then stages it.
+    /// `operation` is `nil` for a conflict left by `git stash pop`.
+    /// When the kept side deleted the file, the file is removed.
+    func resolveConflict(
+        path: String,
+        keeping side: ConflictSide,
+        during operation: GitOperation?,
+        at url: URL
+    ) async throws {
+        // With no operation in progress, the conflict came from reapplying a
+        // stash (an autostash after a pull, usually): "theirs" is the stash.
+        let flag = operation?.checkoutFlag(for: side) ?? (side == .mine ? "--theirs" : "--ours")
+        do {
+            try await runChecked(
+                ["checkout", flag, "--", path],
+                label: "git checkout \(flag)",
+                in: url,
+                timeout: Self.localWriteTimeout
+            )
+        } catch let failure as GitFailure where failure.message.contains("does not have") {
+            try await runChecked(
+                ["rm", "--quiet", "--", path],
+                label: "git rm",
+                in: url,
+                timeout: Self.localWriteTimeout
+            )
+            return
+        }
+        try await markResolved(path: path, at: url)
+    }
+
+    /// `git add -- <path>` after the conflict markers were edited by hand.
+    func markResolved(path: String, at url: URL) async throws {
+        try await runChecked(
+            ["add", "--", path],
+            label: "git add",
+            in: url,
+            timeout: Self.localWriteTimeout
+        )
+    }
+
+    // MARK: - Stash
+
+    func stashList(at url: URL) async throws -> [GitStashEntry] {
+        let raw = try await runChecked(
+            ["stash", "list", "--format=%gd%x1f%s"],
+            label: "git stash list",
+            in: url,
+            timeout: Self.statusTimeout
+        )
+        return Self.parseStashList(raw)
+    }
+
+    /// `git stash push --include-untracked`, so new files are set aside too.
+    func stash(at url: URL, message: String) async throws {
+        try await runChecked(
+            ["stash", "push", "--include-untracked", "-m", message],
+            label: "git stash",
+            in: url,
+            timeout: Self.localWriteTimeout
+        )
+    }
+
+    /// `git stash pop`. Git keeps the entry when reapplying it conflicts.
+    @discardableResult
+    func popStash(_ reference: String, at url: URL) async throws -> String {
+        try await runReporting(
+            ["stash", "pop", reference],
+            label: "git stash pop",
+            in: url,
+            timeout: Self.localWriteTimeout
+        )
+    }
+
+    func dropStash(_ reference: String, at url: URL) async throws {
+        try await runChecked(
+            ["stash", "drop", reference],
+            label: "git stash drop",
+            in: url,
+            timeout: Self.localWriteTimeout
+        )
+    }
+
+    // MARK: - Branches
+
+    /// Local branches and remote-tracking branches, newest commit first.
+    func branches(at url: URL) async throws -> [GitBranchRef] {
+        let raw = try await runChecked(
+            [
+                "for-each-ref", "--sort=-committerdate",
+                "--format=%(refname)%1f%(refname:short)%1f%(upstream:short)%1f%(committerdate:unix)",
+                "refs/heads", "refs/remotes"
+            ],
+            label: "git for-each-ref",
+            in: url,
+            timeout: Self.statusTimeout
+        )
+        return Self.parseBranches(raw)
+    }
+
+    /// `git switch <branch>`. Uncommitted changes come along unless they
+    /// conflict with the other branch, in which case git refuses.
+    func switchBranch(_ name: String, at url: URL) async throws {
+        try await runChecked(
+            ["switch", name],
+            label: "git switch",
+            in: url,
+            timeout: Self.localWriteTimeout
+        )
+    }
+
+    /// `git switch --track <remote>/<branch>`: a local branch for a branch
+    /// another machine pushed.
+    func trackRemoteBranch(_ remoteName: String, at url: URL) async throws {
+        try await runChecked(
+            ["switch", "--track", remoteName],
+            label: "git switch --track",
+            in: url,
+            timeout: Self.localWriteTimeout
+        )
+    }
+
     // MARK: - Parsing
+
+    /// Parses `git log --format=%H%x1f%h%x1f%s%x1f%an%x1f%ct%x1e`.
+    static func parseLog(_ raw: String) -> [GitCommitSummary] {
+        raw.split(separator: "\u{1e}").compactMap { record in
+            let fields = record
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(separator: "\u{1f}", omittingEmptySubsequences: false)
+            guard fields.count == 5, !fields[0].isEmpty else { return nil }
+            return GitCommitSummary(
+                hash: String(fields[0]),
+                shortHash: String(fields[1]),
+                subject: String(fields[2]),
+                author: String(fields[3]),
+                date: Date(timeIntervalSince1970: TimeInterval(fields[4]) ?? 0)
+            )
+        }
+    }
+
+    /// Parses `git for-each-ref` output in the format `branches(at:)` asks for.
+    static func parseBranches(_ raw: String) -> [GitBranchRef] {
+        raw.split(whereSeparator: \.isNewline).compactMap { line in
+            let fields = line.split(separator: "\u{1f}", omittingEmptySubsequences: false)
+            guard fields.count == 4 else { return nil }
+            let refname = fields[0]
+            // `refs/remotes/origin/HEAD` only points at the default branch.
+            if refname.hasSuffix("/HEAD") { return nil }
+            let upstream = String(fields[2])
+            return GitBranchRef(
+                name: String(fields[1]),
+                isRemote: refname.hasPrefix("refs/remotes/"),
+                upstream: upstream.isEmpty ? nil : upstream,
+                lastCommitDate: TimeInterval(fields[3]).map(Date.init(timeIntervalSince1970:))
+            )
+        }
+    }
+
+    /// Parses `git stash list --format=%gd%x1f%s`.
+    static func parseStashList(_ raw: String) -> [GitStashEntry] {
+        raw.split(whereSeparator: \.isNewline).compactMap { line in
+            let fields = line.split(separator: "\u{1f}", maxSplits: 1, omittingEmptySubsequences: false)
+            guard fields.count == 2, !fields[0].isEmpty else { return nil }
+            return GitStashEntry(reference: String(fields[0]), message: String(fields[1]))
+        }
+    }
+
 
     /// Parses `git status --porcelain=v2 --branch -z`.
     ///
@@ -343,11 +632,11 @@ nonisolated struct GitClient: Sendable {
     static func parseStatus(
         _ raw: String,
         remotes: [String],
-        operationInProgress: String?
+        operation: GitOperation?
     ) -> GitStatus {
         var status = GitStatus.empty
         status.remotes = remotes
-        status.operationInProgress = operationInProgress
+        status.operation = operation
 
         let fields = raw.split(separator: "\0", omittingEmptySubsequences: true).map(String.init)
         var index = 0
@@ -442,6 +731,9 @@ nonisolated struct GitClient: Sendable {
         switch tokens[0] {
         case "branch.oid":
             status.hasCommits = value != "(initial)"
+            status.headOID = status.hasCommits ? value : nil
+        case "stash":
+            status.stashCount = Int(value) ?? 0
         case "branch.head":
             if value == "(detached)" {
                 status.isDetached = true

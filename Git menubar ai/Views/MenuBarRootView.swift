@@ -123,8 +123,8 @@ struct MenuBarRootView: View {
     private var actions: some View {
         switch tab {
         case .projects:
-            IconButton(systemImage: "arrow.clockwise", help: "Refresh all projects") {
-                Task { await model.refreshAll() }
+            IconButton(systemImage: "arrow.clockwise", help: "Refresh all projects and check their remotes") {
+                Task { await model.refreshAll(forceFetch: true) }
             }
             IconButton(systemImage: "plus", help: "Add a repository") {
                 Task { await model.addRepository() }

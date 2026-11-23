@@ -38,6 +38,7 @@ final class AppModel {
     let deployments = VercelDeploymentsModel()
     let tokens = TokenUsageModel()
     let commitAI = CommitAISettingsModel()
+    let sync = SyncSettingsModel()
 
     /// The Settings screen covers whatever was showing; closing it returns there.
     var isShowingSettings = false
@@ -51,6 +52,9 @@ final class AppModel {
     private let git = GitClient.shared
     private let store = RepositoryStore()
     private let generator = CommitMessageGenerator()
+    private let syncService = GitSyncService()
+    /// Fetches every repository on `sync.fetchInterval`, window open or not.
+    @ObservationIgnored private var backgroundSyncTask: Task<Void, Never>?
     private var watcher: FileSystemWatcher?
     /// Pending file-event refreshes, one per repository.
     @ObservationIgnored private var refreshTasks: [UUID: Task<Void, Never>] = [:]
@@ -63,11 +67,19 @@ final class AppModel {
     private static let fileEventSettleDelay: Duration = .milliseconds(500)
     /// Upper bound on file-event refreshes per repository while files keep changing.
     private static let minimumFileEventRefreshInterval: Duration = .seconds(3)
+    /// Opening the window fetches repositories not fetched for this long.
+    private static let staleFetchAge: TimeInterval = 30
+    /// Fetches running at once, so many repositories don't open many
+    /// connections together.
+    private static let maximumConcurrentFetches = 4
 
     init() {
         repositories = store.load().map { RepositoryState(repository: $0) }
         sortRepositories()
         usage.startAutoRefresh()
+        // Fetching starts at launch, not when the window first opens, so the
+        // other machines' commits arrive even if the menu is never opened.
+        restartBackgroundSync()
     }
 
     /// Begins watching the stored repositories. Idempotent, so the view can call
@@ -115,8 +127,10 @@ final class AppModel {
 
     // MARK: - Lifecycle
 
-    /// Called when the menu bar window opens.
-    func refreshAll() async {
+    /// Called when the menu bar window opens, and on its poll.
+    /// - Parameter forceFetch: Fetch every remote now, instead of only the
+    ///   ones not fetched in the last half minute.
+    func refreshAll(forceFetch: Bool = false) async {
         actionFailure = nil
         await verifyGitIsAvailable()
         await withTaskGroup(of: Void.self) { group in
@@ -126,6 +140,7 @@ final class AppModel {
                 }
             }
         }
+        await fetchAll(onlyIfOlderThan: forceFetch ? nil : Self.staleFetchAge)
     }
 
     private func verifyGitIsAvailable() async {
@@ -176,6 +191,10 @@ final class AppModel {
             }
             if state.status != status { state.status = status }
             if state.loadFailure != nil { state.loadFailure = nil }
+            if state.lastFetchedAt == nil {
+                state.lastFetchedAt = Self.lastFetchDate(in: state.repository.url)
+            }
+            await loadCommitLists(for: state, status: status)
         } catch let failure as GitFailure {
             state.loadFailure = failure
         } catch {
@@ -427,19 +446,31 @@ final class AppModel {
             try await git.commit(at: state.repository.url, message: message)
             recordActivity(for: state)
 
+            // The commit is made. Clear the composer now, so a push that
+            // fails below doesn't invite committing the same message twice.
+            state.commitMessage = ""
+            state.generationNote = nil
+
+            var pushResult: GitSyncService.PushResult?
             if push {
                 state.activity = "Pushing…"
-                try await git.push(at: state.repository.url)
+                await waitForFetch(of: state)
+                pushResult = try await syncService.push(
+                    at: state.repository.url,
+                    integratingWith: sync.pullBeforePush ? sync.pullStrategy : nil
+                )
             }
 
             state.activity = nil
-            state.commitMessage = ""
-            state.generationNote = nil
-            if push {
+            switch pushResult {
+            case nil:
+                state.lastSuccess = "Committed locally."
+            case .pushed:
                 state.lastSuccess = upstream.map { "Committed and pushed to \($0)." }
                     ?? "Committed and pushed."
-            } else {
-                state.lastSuccess = "Committed locally."
+            case .pulledThenPushed(let pulled):
+                state.lastSuccess = "Committed, pulled the other machine’s commits, and pushed."
+                noteKeptAutostash(pulled, on: state)
             }
         } catch let failure as GitFailure {
             state.activity = nil
@@ -483,6 +514,345 @@ final class AppModel {
             )
         }
         await refresh(state)
+    }
+
+    // MARK: - Syncing with other machines
+
+    /// (Re)starts the background fetch loop with the current interval.
+    func restartBackgroundSync() {
+        backgroundSyncTask?.cancel()
+        guard let interval = sync.fetchInterval.duration else {
+            backgroundSyncTask = nil
+            return
+        }
+        backgroundSyncTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: interval)
+                guard !Task.isCancelled, let self else { return }
+                await fetchAll(onlyIfOlderThan: nil)
+            }
+        }
+    }
+
+    /// Fetches every repository that has a remote, a few at a time.
+    /// - Parameter maxAge: Skip repositories fetched more recently than this.
+    func fetchAll(onlyIfOlderThan maxAge: TimeInterval?) async {
+        // The window may never have opened since launch.
+        for state in repositories where state.status == nil && state.loadFailure == nil {
+            await refresh(state)
+        }
+        let now = Date()
+        let due = repositories.filter { state in
+            guard let status = state.status, !status.remotes.isEmpty else { return false }
+            guard let maxAge, let last = state.lastFetchedAt else { return true }
+            return now.timeIntervalSince(last) >= maxAge
+        }
+        var index = 0
+        while index < due.count {
+            let batch = due[index..<min(index + Self.maximumConcurrentFetches, due.count)]
+            index += batch.count
+            await withTaskGroup(of: Void.self) { group in
+                for state in batch {
+                    group.addTask { @MainActor in
+                        await self.fetch(state, userInitiated: false)
+                    }
+                }
+            }
+        }
+    }
+
+    /// `git fetch`, then an automatic fast-forward when it is safe.
+    func fetch(_ state: RepositoryState, userInitiated: Bool = true) async {
+        guard !state.isFetching, !state.isBusy else { return }
+        guard repositories.contains(where: { $0 === state }) else { return }
+        guard let remotes = state.status?.remotes, !remotes.isEmpty else {
+            await refresh(state)
+            return
+        }
+        state.isFetching = true
+        if userInitiated { state.clearOutcome() }
+
+        do {
+            try await git.fetch(at: state.repository.url)
+            state.lastFetchedAt = Date()
+            if state.fetchFailure != nil { state.fetchFailure = nil }
+            // The remote refs moved, so the commit lists must be read again.
+            state.commitListKey = nil
+        } catch let failure as GitFailure {
+            state.fetchFailure = failure
+            if userInitiated { state.operationFailure = failure }
+        } catch {
+            let failure = GitFailure(command: "git fetch", exitCode: -1, message: error.localizedDescription)
+            state.fetchFailure = failure
+            if userInitiated { state.operationFailure = failure }
+        }
+        state.isFetching = false
+
+        await refresh(state)
+        await fastForwardIfPossible(state)
+    }
+
+    /// Brings a branch with no local commits up to date unattended. Git itself
+    /// refuses, changing nothing, if a local edit overlaps an incoming change.
+    private func fastForwardIfPossible(_ state: RepositoryState) async {
+        guard
+            sync.autoFastForward,
+            !state.isBusy,
+            let status = state.status,
+            GitSyncService.canAutoFastForward(status)
+        else {
+            if state.autoUpdateBlocked, state.status?.behind == 0 { state.autoUpdateBlocked = false }
+            return
+        }
+
+        state.activity = "Updating…"
+        do {
+            try await git.fastForward(at: state.repository.url)
+            state.lastAutoUpdate = .init(commitCount: status.behind, date: Date())
+            state.autoUpdateBlocked = false
+            recordActivity(for: state)
+        } catch {
+            state.autoUpdateBlocked = true
+        }
+        state.activity = nil
+        await refresh(state)
+    }
+
+    /// `git pull` with the strategy chosen in Settings.
+    func pull(_ state: RepositoryState) async {
+        guard let status = state.status else { return }
+        if let blocker = status.pullBlocker {
+            state.operationFailure = GitFailure(command: "git pull", exitCode: -1, message: blocker.message)
+            return
+        }
+        let upstream = status.upstream ?? "the remote"
+        await runSyncAction(on: state, activity: "Pulling…", command: "git pull") {
+            let pulled = try await self.syncService.pull(at: state.repository.url, strategy: self.sync.pullStrategy)
+            self.noteKeptAutostash(pulled, on: state)
+            return "Pulled the latest commits from \(upstream)."
+        }
+    }
+
+    /// `git push` of commits already made, pulling first if the remote moved.
+    func push(_ state: RepositoryState) async {
+        guard let status = state.status else { return }
+        if let blocker = status.pushBlocker {
+            state.operationFailure = GitFailure(command: "git push", exitCode: -1, message: blocker.message)
+            return
+        }
+        let upstream = status.upstream ?? "the remote"
+        await runSyncAction(on: state, activity: "Pushing…", command: "git push") {
+            let result = try await self.syncService.push(
+                at: state.repository.url,
+                integratingWith: self.sync.pullBeforePush ? self.sync.pullStrategy : nil
+            )
+            switch result {
+            case .pushed:
+                return "Pushed to \(upstream)."
+            case .pulledThenPushed(let pulled):
+                self.noteKeptAutostash(pulled, on: state)
+                return "Pulled the other machine’s commits, then pushed to \(upstream)."
+            }
+        }
+    }
+
+    /// Pull, then push: both machines end up with the same history.
+    func syncNow(_ state: RepositoryState) async {
+        guard let status = state.status else { return }
+        if let blocker = status.pullBlocker {
+            state.operationFailure = GitFailure(command: "git pull", exitCode: -1, message: blocker.message)
+            return
+        }
+        let upstream = status.upstream ?? "the remote"
+        await runSyncAction(on: state, activity: "Syncing…", command: "git pull") {
+            let result = try await self.syncService.sync(at: state.repository.url, strategy: self.sync.pullStrategy)
+            self.noteKeptAutostash(result.pull, on: state)
+            return result.pushed ? "In sync with \(upstream)." : "Pulled from \(upstream)."
+        }
+    }
+
+    // MARK: Interrupted merges and rebases
+
+    func continueOperation(_ state: RepositoryState) async {
+        guard let operation = state.status?.operation else { return }
+        await runSyncAction(on: state, activity: "Continuing…", command: "git \(operation.subcommand) --continue") {
+            try await self.git.continueOperation(operation, at: state.repository.url)
+            return "\(operation.title) finished."
+        }
+    }
+
+    func abortOperation(_ state: RepositoryState) async {
+        guard let operation = state.status?.operation else { return }
+        await runSyncAction(on: state, activity: "Aborting…", command: "git \(operation.subcommand) --abort") {
+            try await self.git.abortOperation(operation, at: state.repository.url)
+            return "\(operation.title) aborted. Everything is back as it was."
+        }
+    }
+
+    func skipCommit(_ state: RepositoryState) async {
+        guard let operation = state.status?.operation, operation.canSkip else { return }
+        await runSyncAction(on: state, activity: "Skipping…", command: "git \(operation.subcommand) --skip") {
+            try await self.git.skipCommit(operation, at: state.repository.url)
+            return "Skipped that commit."
+        }
+    }
+
+    func resolveConflict(_ change: GitFileChange, keeping side: ConflictSide, in state: RepositoryState) async {
+        let operation = state.status?.operation
+        await runSyncAction(on: state, activity: "Resolving…", command: "Resolve conflict") {
+            try await self.git.resolveConflict(
+                path: change.path,
+                keeping: side,
+                during: operation,
+                at: state.repository.url
+            )
+            return nil
+        }
+    }
+
+    func markResolved(_ change: GitFileChange, in state: RepositoryState) async {
+        if Self.containsConflictMarkers(state.repository.url.appending(path: change.path)) {
+            state.clearOutcome()
+            state.operationFailure = GitFailure(
+                command: "Mark resolved",
+                exitCode: -1,
+                message: "\(change.fileName) still has conflict markers (<<<<<<<). Edit it first, or keep one whole version."
+            )
+            return
+        }
+        await runSyncAction(on: state, activity: "Resolving…", command: "git add") {
+            try await self.git.markResolved(path: change.path, at: state.repository.url)
+            return nil
+        }
+    }
+
+    /// Unresolved files still contain git's marker lines.
+    private nonisolated static func containsConflictMarkers(_ url: URL) -> Bool {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe), !data.prefix(8_000).contains(0) else {
+            return false
+        }
+        let text = String(decoding: data, as: UTF8.self)
+        return text.contains("\n<<<<<<< ") || text.hasPrefix("<<<<<<< ")
+    }
+
+    // MARK: Stash
+
+    func stashChanges(_ state: RepositoryState) async {
+        let stamp = Date().formatted(date: .abbreviated, time: .shortened)
+        await runSyncAction(on: state, activity: "Stashing…", command: "git stash") {
+            try await self.git.stash(at: state.repository.url, message: "CodeBarAI \(stamp)")
+            return "Changes stashed. Restore them from the ⋯ menu."
+        }
+    }
+
+    func popStash(_ entry: GitStashEntry, in state: RepositoryState) async {
+        await runSyncAction(on: state, activity: "Restoring…", command: "git stash pop") {
+            let output = try await self.git.popStash(entry.reference, at: state.repository.url)
+            if output.lowercased().contains("conflict") {
+                state.syncNotice = "Restored with conflicts. The stash entry was kept; delete it once the files look right."
+                return nil
+            }
+            return "Stashed changes restored."
+        }
+    }
+
+    func dropStash(_ entry: GitStashEntry, in state: RepositoryState) async {
+        await runSyncAction(on: state, activity: "Deleting stash…", command: "git stash drop") {
+            try await self.git.dropStash(entry.reference, at: state.repository.url)
+            return "Stash entry deleted."
+        }
+    }
+
+    // MARK: Branches
+
+    /// Loads branches and stash entries for the detail screen's menus.
+    func loadRefs(for state: RepositoryState) async {
+        let url = state.repository.url
+        async let branches = try? git.branches(at: url)
+        async let stashes = try? git.stashList(at: url)
+        let (loadedBranches, loadedStashes) = await (branches, stashes)
+        if let loadedBranches, loadedBranches != state.branches { state.branches = loadedBranches }
+        if let loadedStashes, loadedStashes != state.stashes { state.stashes = loadedStashes }
+    }
+
+    /// Switches to a local branch, or creates one tracking a remote branch.
+    func switchBranch(to branch: GitBranchRef, in state: RepositoryState) async {
+        let hasLocal = state.branches.contains { !$0.isRemote && $0.name == branch.localName }
+        await runSyncAction(on: state, activity: "Switching…", command: "git switch") {
+            if branch.isRemote && !hasLocal {
+                try await self.git.trackRemoteBranch(branch.name, at: state.repository.url)
+            } else {
+                try await self.git.switchBranch(branch.localName, at: state.repository.url)
+            }
+            return "Switched to \(branch.localName)."
+        }
+        await loadRefs(for: state)
+    }
+
+    // MARK: Helpers
+
+    /// Runs one sync action with the usual busy state, banners and refresh.
+    /// `work` returns the success message, or `nil` for none.
+    private func runSyncAction(
+        on state: RepositoryState,
+        activity: String,
+        command: String,
+        _ work: () async throws -> String?
+    ) async {
+        guard !state.isBusy else { return }
+        state.clearOutcome()
+        state.activity = activity
+        await waitForFetch(of: state)
+        do {
+            if let message = try await work() { state.lastSuccess = message }
+            state.autoUpdateBlocked = false
+        } catch let failure as GitFailure {
+            state.operationFailure = failure
+        } catch {
+            state.operationFailure = GitFailure(command: command, exitCode: -1, message: error.localizedDescription)
+        }
+        state.activity = nil
+        state.commitListKey = nil
+        recordActivity(for: state)
+        await refresh(state)
+        if state.stashes.count != state.status?.stashCount ?? 0 { await loadRefs(for: state) }
+    }
+
+    /// A background fetch and a pull or push would race for the same refs.
+    private func waitForFetch(of state: RepositoryState) async {
+        while state.isFetching, !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(150))
+        }
+    }
+
+    private func noteKeptAutostash(_ result: GitSyncService.PullResult, on state: RepositoryState) {
+        guard result.autostashKept else { return }
+        state.syncNotice = "Your uncommitted changes overlapped the pulled ones, so git kept them in the stash. Restore them from the ⋯ menu."
+    }
+
+    /// Reads the incoming and outgoing commits when HEAD or the counts moved.
+    private func loadCommitLists(for state: RepositoryState, status: GitStatus) async {
+        let key = [status.headOID ?? "", status.upstream ?? "", "\(status.ahead)", "\(status.behind)"]
+            .joined(separator: "|")
+        guard key != state.commitListKey else { return }
+        state.commitListKey = key
+
+        guard status.upstream != nil, status.ahead > 0 || status.behind > 0 else {
+            if !state.incoming.isEmpty { state.incoming = [] }
+            if !state.outgoing.isEmpty { state.outgoing = [] }
+            return
+        }
+        let url = state.repository.url
+        let incoming = status.behind > 0 ? (try? await git.incomingCommits(at: url)) ?? [] : []
+        let outgoing = status.ahead > 0 ? (try? await git.outgoingCommits(at: url)) ?? [] : []
+        if state.incoming != incoming { state.incoming = incoming }
+        if state.outgoing != outgoing { state.outgoing = outgoing }
+    }
+
+    /// `FETCH_HEAD` is rewritten by every fetch, including ones from Terminal.
+    private nonisolated static func lastFetchDate(in repository: URL) -> Date? {
+        let fetchHead = repository.appending(path: ".git/FETCH_HEAD")
+        return try? fetchHead.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
     }
 
     // MARK: - Opening the repository elsewhere

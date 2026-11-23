@@ -98,9 +98,91 @@ nonisolated enum PushBlocker: Equatable, Sendable {
     }
 }
 
+/// Why pulling cannot run right now.
+nonisolated enum PullBlocker: Equatable, Sendable {
+    case conflicts(count: Int)
+    case operationInProgress(String)
+    case detachedHead
+    case noUpstream(branch: String)
+
+    var message: String {
+        switch self {
+        case .conflicts(let count):
+            let files = count == 1 ? "file" : "files"
+            return "\(count) conflicted \(files). Resolve them before pulling."
+        case .operationInProgress(let name):
+            return "\(name) is in progress. Continue or abort it first."
+        case .detachedHead:
+            return "HEAD is detached. Check out a branch to pull."
+        case .noUpstream(let branch):
+            return "“\(branch)” has no upstream to pull from."
+        }
+    }
+}
+
+/// An interrupted multi-step git command, detected from its marker files.
+nonisolated enum GitOperation: String, Sendable, Hashable {
+    case rebase
+    case merge
+    case cherryPick
+    case revert
+
+    /// Used in sentences, e.g. "A rebase is in progress".
+    var displayName: String {
+        switch self {
+        case .rebase: return "A rebase"
+        case .merge: return "A merge"
+        case .cherryPick: return "A cherry-pick"
+        case .revert: return "A revert"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .rebase: return "Rebase"
+        case .merge: return "Merge"
+        case .cherryPick: return "Cherry-pick"
+        case .revert: return "Revert"
+        }
+    }
+
+    /// The git subcommand that owns `--continue` and `--abort`.
+    var subcommand: String {
+        switch self {
+        case .rebase: return "rebase"
+        case .merge: return "merge"
+        case .cherryPick: return "cherry-pick"
+        case .revert: return "revert"
+        }
+    }
+
+    /// Whether `--skip` drops the commit being applied.
+    var canSkip: Bool { self == .rebase || self == .cherryPick }
+
+    /// The `git checkout` side holding this machine's own work. A rebase
+    /// replays local commits on top of the upstream, so "ours" there is the
+    /// upstream and "theirs" is the local commit being replayed.
+    func checkoutFlag(for side: ConflictSide) -> String {
+        let mineIsOurs = self != .rebase
+        switch side {
+        case .mine: return mineIsOurs ? "--ours" : "--theirs"
+        case .theirs: return mineIsOurs ? "--theirs" : "--ours"
+        }
+    }
+}
+
+/// Which version of a conflicted file to keep.
+nonisolated enum ConflictSide: Sendable, Hashable {
+    /// The version committed on this machine.
+    case mine
+    /// The version that came from the remote or the commit being applied.
+    case theirs
+}
+
 /// Why committing cannot run right now.
 nonisolated enum CommitBlocker: Equatable, Sendable {
     case conflicts(count: Int)
+    case operationInProgress(String)
     case nothingToCommit
 
     var message: String {
@@ -108,6 +190,8 @@ nonisolated enum CommitBlocker: Equatable, Sendable {
         case .conflicts(let count):
             let files = count == 1 ? "file" : "files"
             return "\(count) conflicted \(files). Resolve the conflicts before committing."
+        case .operationInProgress(let name):
+            return "\(name) is in progress. Press Continue to finish it, or Abort."
         case .nothingToCommit:
             return "No changes to commit."
         }
@@ -127,8 +211,15 @@ nonisolated struct GitStatus: Sendable, Equatable {
     var remotes: [String]
     /// `true` once the repository has at least one commit.
     var hasCommits: Bool
+    /// An interrupted merge, rebase, cherry-pick or revert.
+    var operation: GitOperation?
+    /// The commit HEAD points to, when there is one.
+    var headOID: String?
+    /// Entries in `git stash list`.
+    var stashCount: Int
+
     /// A human readable name for an in-flight merge, rebase or cherry-pick.
-    var operationInProgress: String?
+    var operationInProgress: String? { operation?.displayName }
 
     var conflicts: [GitFileChange] {
         changes.filter { $0.kind == .conflicted }
@@ -147,6 +238,7 @@ nonisolated struct GitStatus: Sendable, Equatable {
 
     var commitBlocker: CommitBlocker? {
         if !conflicts.isEmpty { return .conflicts(count: conflicts.count) }
+        if let operationInProgress { return .operationInProgress(operationInProgress) }
         if changes.isEmpty { return .nothingToCommit }
         return nil
     }
@@ -160,6 +252,19 @@ nonisolated struct GitStatus: Sendable, Equatable {
         if upstream == nil {
             return .noUpstream(branch: branch, canPublish: !remotes.isEmpty)
         }
+        return nil
+    }
+
+    /// Both sides have commits the other lacks, so pulling has to rebase or merge.
+    var isDiverged: Bool { ahead > 0 && behind > 0 }
+
+    /// Checked before pulling, and also used to explain a disabled Pull button.
+    var pullBlocker: PullBlocker? {
+        if !conflicts.isEmpty { return .conflicts(count: conflicts.count) }
+        if let operationInProgress { return .operationInProgress(operationInProgress) }
+        if isDetached { return .detachedHead }
+        guard let branch, !branch.isEmpty else { return .detachedHead }
+        if upstream == nil { return .noUpstream(branch: branch) }
         return nil
     }
 
@@ -180,7 +285,9 @@ nonisolated struct GitStatus: Sendable, Equatable {
         changes: [],
         remotes: [],
         hasCommits: false,
-        operationInProgress: nil
+        operation: nil,
+        headOID: nil,
+        stashCount: 0
     )
 }
 

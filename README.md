@@ -26,6 +26,16 @@ A macOS menu bar app for developers who work with AI coding tools. It shows how 
 - **Commit** or **Commit & Push** in one click (`git add -A`, `git commit`, `git push`).
 - **Publish** a branch that has no upstream yet (`git push --set-upstream`).
 - Clear warnings for merge conflicts, a detached HEAD, a merge/rebase/cherry-pick in progress, or a branch with no remote.
+
+### Working from several machines
+- **Background fetch**: every project runs `git fetch --all --prune` every minute by default, even with the menu closed. Choose 1, 5 or 15 minutes, or turn it off, in **Settings**. Opening the menu also fetches projects not checked in the last 30 seconds, and the refresh buttons fetch right away.
+- **Automatic updates**: when a branch has new commits on the remote and none of its own to push, CodeBarAI fast-forwards it (`git merge --ff-only @{upstream}`). Git refuses, changing nothing, if an uncommitted edit touches a file the incoming commits change; the project then shows **Pull** instead.
+- **Sync card**: each project shows whether it is up to date, behind (**Pull**), ahead (**Push**), or diverged (**Sync** pulls, then pushes), with the incoming and unpushed commits listed.
+- **Pull strategy**: Rebase (default, keeps history linear), Merge, or Fast-forward only. Pulls use `--autostash`, so uncommitted work is set aside and put back.
+- **Rejected pushes**: if another machine pushed first, **Commit & Push** and **Push** pull those commits in and push again. You can turn this off in Settings.
+- **Conflicts**: a paused rebase or merge gets **Continue**, **Abort** and (for rebases) **Skip Commit**. Each conflicted file has a **Resolve** menu: keep your version, keep theirs, open it in Cursor, or mark it resolved after editing. CodeBarAI won't mark a file as resolved while it still has conflict markers.
+- **Stash**: **Stash Changes** from the ⋯ menu, then restore or delete entries later. If an autostash can't be put back cleanly, CodeBarAI tells you, and the stash entry is kept.
+- **Branches**: **Switch Branch** lists local branches, plus branches pushed from other machines (`git switch --track`).
 - **Sensitive file check**: before committing, CodeBarAI warns you if `git add -A` would include files like `.env`, `id_rsa`, `*.pem`, `*.p12` or `credentials.json`, and asks you to confirm.
 
 ### Running servers
@@ -93,6 +103,12 @@ To check server discovery and graceful/forced shutdown using temporary Node serv
 
 ```bash
 bash scripts/test-running-servers.sh
+```
+
+To check fetching, pulling, rejected-push recovery, conflict resolution, stash and branch tracking, using a temporary remote and two clones that act as two machines:
+
+```bash
+bash scripts/test-git-sync.sh
 ```
 
 ### Using multiple Claude accounts

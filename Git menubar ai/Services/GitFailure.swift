@@ -36,7 +36,21 @@ nonisolated struct GitFailure: Error, Identifiable, Sendable, Equatable {
             || (text.contains("rejected") && text.contains("behind")) {
             return "The remote has commits you don't have yet. Pull or rebase, then push again."
         }
-        if text.contains("no upstream branch") {
+        if text.contains("conflict") || text.contains("could not apply") {
+            return "Some files changed on both machines. Keep your version or theirs for each conflicted file, then press Continue."
+        }
+        if text.contains("would be overwritten") {
+            return "Your uncommitted changes touch the same files. Commit or stash them first."
+        }
+        if text.contains("not possible to fast-forward") || text.contains("diverging") {
+            return "Both machines have new commits. Choose Rebase or Merge in Settings, then press Sync."
+        }
+        if text.contains("could not resolve host") || text.contains("unable to access")
+            || text.contains("timed out") || text.contains("network is unreachable")
+            || text.contains("could not read from remote") {
+            return "Couldn't reach the remote. Check the network connection and try again."
+        }
+        if text.contains("no upstream branch") || text.contains("no tracking information") {
             return "Publish the branch first so it has an upstream to push to."
         }
         if text.contains("nothing to commit") || text.contains("no changes added to commit") {

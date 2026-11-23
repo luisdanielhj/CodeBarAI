@@ -181,6 +181,9 @@ struct ProjectRow: View {
             } else if status.changedFileCount > 0 {
                 Chip(text: "\(status.changedFileCount)", tint: .orange)
                     .help("\(status.changedFileCount) changed files")
+            } else if status.behind > 0 {
+                Chip(text: "\(status.behind)", systemImage: "arrow.down", tint: .blue)
+                    .help("\(status.behind) new commits to pull")
             }
         } else if state.isRefreshing {
             // Only before the first status. Later refreshes stay silent so the

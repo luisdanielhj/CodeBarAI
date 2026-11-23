@@ -29,6 +29,35 @@ final class RepositoryState: Identifiable {
     /// Note about how the last message was produced, or why the model was skipped.
     var generationNote: String?
 
+    // MARK: Sync with other machines
+
+    var isFetching = false
+    /// When the last fetch finished, from this app or from `FETCH_HEAD`.
+    var lastFetchedAt: Date?
+    /// Why the last background fetch failed. Cleared by the next success.
+    var fetchFailure: GitFailure?
+    /// Commits on the upstream that this machine doesn't have yet.
+    var incoming: [GitCommitSummary] = []
+    /// Commits made here that haven't been pushed.
+    var outgoing: [GitCommitSummary] = []
+    /// Identifies the state `incoming` and `outgoing` were read for.
+    @ObservationIgnored var commitListKey: String?
+    var branches: [GitBranchRef] = []
+    var stashes: [GitStashEntry] = []
+    /// The last automatic fast-forward.
+    var lastAutoUpdate: AutoUpdate?
+    /// Set when an automatic fast-forward had to be skipped because local
+    /// edits touch files the incoming commits change.
+    var autoUpdateBlocked = false
+    /// Something the user should know after a sync that still succeeded,
+    /// such as uncommitted work that stayed in the stash.
+    var syncNotice: String?
+
+    struct AutoUpdate: Equatable {
+        var commitCount: Int
+        var date: Date
+    }
+
     // MARK: Operations
 
     /// Non-nil while a git write operation runs, e.g. "Pushing…".
@@ -67,9 +96,21 @@ final class RepositoryState: Identifiable {
         return status.pushBlocker == nil && canCommit
     }
 
+    /// Push without committing: there are local commits and nothing blocks it.
+    var canPushCommits: Bool {
+        guard let status, !isBusy else { return false }
+        return status.pushBlocker == nil && status.ahead > 0
+    }
+
+    var canPull: Bool {
+        guard let status, !isBusy else { return false }
+        return status.pullBlocker == nil
+    }
+
     /// Clears the transient banners so a new action starts from a clean slate.
     func clearOutcome() {
         operationFailure = nil
         lastSuccess = nil
+        syncNotice = nil
     }
 }

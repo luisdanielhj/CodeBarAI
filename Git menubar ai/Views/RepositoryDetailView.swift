@@ -6,6 +6,19 @@ struct RepositoryDetailView: View {
     @Environment(AppModel.self) private var model
     let state: RepositoryState
     let maxHeight: CGFloat
+    @State private var showsCommits = false
+
+    /// Room the sync card takes from the changed-file list.
+    private var syncCardHeight: CGFloat {
+        guard state.status?.remotes.isEmpty == false else { return 0 }
+        return showsCommits ? 190 : 56
+    }
+
+    /// Reloads the branch and stash menus when HEAD, the branch or the stash moves.
+    private var refsKey: String {
+        guard let status = state.status else { return "" }
+        return "\(status.branch ?? "")|\(status.headOID ?? "")|\(status.stashCount)|\(state.lastFetchedAt?.timeIntervalSince1970 ?? 0)"
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -13,12 +26,14 @@ struct RepositoryDetailView: View {
 
             VStack(alignment: .leading, spacing: 10) {
                 OpenInRow(state: state)
+                SyncCard(state: state, showsCommits: $showsCommits)
+                OperationCard(state: state)
                 notices
             }
             .padding(.horizontal, Theme.edge)
             .padding(.bottom, 10)
 
-            ChangedFilesSection(state: state, maxHeight: max(120, maxHeight - 326))
+            ChangedFilesSection(state: state, maxHeight: max(120, maxHeight - 326 - syncCardHeight))
 
             Divider().opacity(0.5)
 
@@ -35,6 +50,9 @@ struct RepositoryDetailView: View {
             try? await Task.sleep(for: .seconds(4))
             guard !Task.isCancelled else { return }
             withAnimation { state.lastSuccess = nil }
+        }
+        .task(id: refsKey) {
+            await model.loadRefs(for: state)
         }
     }
 
@@ -64,12 +82,14 @@ struct RepositoryDetailView: View {
             if state.isRefreshing {
                 InlineSpinner()
             } else {
-                IconButton(systemImage: "arrow.clockwise", help: "Refresh") {
-                    Task { await model.refresh(state) }
+                IconButton(systemImage: "arrow.clockwise", help: "Refresh and check the remote") {
+                    Task { await model.fetch(state) }
                 }
             }
 
             IconMenu(help: "More actions") {
+                SyncMenuItems(state: state)
+                Divider()
                 Button("Show in Finder") { model.openInFinder(state) }
                 Button("Open in Terminal") { Task { await model.openInTerminal(state) } }
                 if model.usage.claudeAccounts.count > 1 {
@@ -135,42 +155,91 @@ struct RepositoryDetailView: View {
                 .transition(.opacity)
         }
 
-        if let operation = state.status?.operationInProgress {
-            InlineBanner(kind: .warning, title: "\(operation) is in progress",
-                         detail: "Finish or abort it in a terminal before committing.")
+        if let notice = state.syncNotice {
+            InlineBanner(kind: .warning, title: "Check your stashed changes", detail: notice) {
+                state.syncNotice = nil
+            }
         }
 
         if let status = state.status, !status.isClean, let blocker = status.pushBlocker {
             switch blocker {
-            case .noUpstream(let branch, true):
-                HStack(spacing: 8) {
-                    Image(systemName: "icloud.and.arrow.up")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                    Text("“\(branch)” isn’t on the remote yet.")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                    Spacer(minLength: 4)
-                    Button("Publish") {
-                        Task { await model.publishBranch(for: state) }
-                    }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11, weight: .semibold))
-                    .padding(.horizontal, 9)
-                    .frame(height: 22)
-                    .background(Color.primary.opacity(0.08), in: Capsule())
-                    .disabled(state.isBusy)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .card()
-            case .operationInProgress:
-                // Already explained by the banner above.
+            case .noUpstream(_, true), .operationInProgress, .conflicts:
+                // The sync card offers Publish; the operation card covers the rest.
                 EmptyView()
             default:
                 InlineBanner(kind: .warning, title: "Push is blocked", detail: blocker.message)
             }
+        }
+    }
+}
+
+/// Fetch, pull, push, branches and stash, for the detail screen's ⋯ menu.
+private struct SyncMenuItems: View {
+    @Environment(AppModel.self) private var model
+    let state: RepositoryState
+
+    var body: some View {
+        let status = state.status
+        let hasRemote = status?.remotes.isEmpty == false
+
+        if hasRemote {
+            Button("Fetch") { Task { await model.fetch(state) } }
+                .disabled(state.isBusy || state.isFetching)
+            Button("Pull (\(model.sync.pullStrategy.title))") { Task { await model.pull(state) } }
+                .disabled(!state.canPull)
+            Button("Push") { Task { await model.push(state) } }
+                .disabled(!state.canPushCommits)
+            Button("Sync (Pull, then Push)") { Task { await model.syncNow(state) } }
+                .disabled(!state.canPull)
+        }
+
+        Menu("Switch Branch") {
+            let local = state.branches.filter { !$0.isRemote }
+            let localNames = Set(local.map(\.name))
+            let remoteOnly = state.branches.filter { $0.isRemote && !localNames.contains($0.localName) }
+            ForEach(local.prefix(25)) { branch in
+                let isCurrent = branch.name == status?.branch
+                Button {
+                    Task { await model.switchBranch(to: branch, in: state) }
+                } label: {
+                    if isCurrent {
+                        Label(branch.name, systemImage: "checkmark")
+                    } else {
+                        Text(branch.name)
+                    }
+                }
+                .disabled(isCurrent)
+            }
+            if !remoteOnly.isEmpty {
+                Section("From other machines") {
+                    ForEach(remoteOnly.prefix(25)) { branch in
+                        Button(branch.name) {
+                            Task { await model.switchBranch(to: branch, in: state) }
+                        }
+                    }
+                }
+            }
+        }
+        .disabled(state.isBusy || status?.operation != nil)
+
+        Divider()
+
+        Button("Stash Changes") { Task { await model.stashChanges(state) } }
+            .disabled(state.isBusy || status?.isClean != false || status?.operation != nil)
+        if !state.stashes.isEmpty {
+            Menu("Stashed Changes (\(state.stashes.count))") {
+                ForEach(state.stashes) { entry in
+                    Menu(entry.message) {
+                        Button("Restore and Remove") {
+                            Task { await model.popStash(entry, in: state) }
+                        }
+                        Button("Delete", role: .destructive) {
+                            Task { await model.dropStash(entry, in: state) }
+                        }
+                    }
+                }
+            }
+            .disabled(state.isBusy)
         }
     }
 }
@@ -281,8 +350,14 @@ struct ChangedFilesSection: View {
                     FittedScrollView(maxHeight: maxHeight, estimatedHeight: CGFloat(min(status.changes.count, 6)) * 26) {
                         LazyVStack(spacing: 0) {
                             ForEach(status.changes) { change in
-                                ChangedFileRow(change: change) {
-                                    Task { await model.openInCursor(change, in: state) }
+                                HStack(spacing: 2) {
+                                    ChangedFileRow(change: change) {
+                                        Task { await model.openInCursor(change, in: state) }
+                                    }
+                                    if change.kind == .conflicted {
+                                        ConflictResolveMenu(change: change, state: state)
+                                            .padding(.trailing, 6)
+                                    }
                                 }
                             }
                         }

@@ -29,6 +29,8 @@ struct SettingsView: View {
                     }
                     descriptionToggle
                     Divider().opacity(0.5)
+                    syncSection
+                    Divider().opacity(0.5)
                     vercelSection
                 }
                 .padding(Theme.edge)
@@ -50,7 +52,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Settings")
                     .font(.system(size: 13, weight: .semibold))
-                Text("Commit messages and Vercel")
+                Text("Commit messages, syncing and Vercel")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
             }
@@ -257,6 +259,72 @@ struct SettingsView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .card()
+    }
+
+    // MARK: Sync
+
+    private var syncSection: some View {
+        @Bindable var sync = model.sync
+        return VStack(alignment: .leading, spacing: 10) {
+            SectionHeader(title: "Check remotes for new commits")
+            SegmentedControl(
+                items: AutoFetchInterval.allCases,
+                selection: $sync.fetchInterval,
+                title: \.title
+            )
+            Text("Runs git fetch for every project in the background, even with this menu closed, so commits from your other machines show up on their own.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            SectionHeader(title: "When pulling")
+                .padding(.top, 2)
+            SegmentedControl(
+                items: PullStrategy.allCases,
+                selection: $sync.pullStrategy,
+                title: \.title
+            )
+            Text(sync.pullStrategy.explanation + " Uncommitted changes are stashed and put back.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(spacing: 0) {
+                settingToggle(
+                    isOn: $sync.autoFastForward,
+                    title: "Update automatically",
+                    detail: "Pull new commits as soon as they’re found, when this machine has none of its own to push and no local edit touches the same files."
+                )
+                Divider().opacity(0.5).padding(.horizontal, 10)
+                settingToggle(
+                    isOn: $sync.pullBeforePush,
+                    title: "Pull first when a push is rejected",
+                    detail: "If another machine pushed first, bring its commits in and push again."
+                )
+            }
+            .card()
+        }
+        .onChange(of: model.sync.fetchInterval) {
+            model.restartBackgroundSync()
+        }
+    }
+
+    private func settingToggle(isOn: Binding<Bool>, title: String, detail: String) -> some View {
+        Toggle(isOn: isOn) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 12, weight: .medium))
+                Text(detail)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .toggleStyle(.switch)
+        .controlSize(.small)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
     }
 
     // MARK: Vercel
