@@ -153,7 +153,7 @@ final class AIUsageModel {
     }
 
     private func synchronizeMenuBarOrder() {
-        let providerOrder: [AIUsageProvider: Int] = [.claude: 0, .codex: 1, .cursor: 2, .kiro: 3]
+        let providerOrder: [AIUsageProvider: Int] = [.claude: 0, .codex: 1, .cursor: 2, .kiro: 3, .antigravity: 4]
         let standardOrder = states.enumerated().sorted { lhs, rhs in
             let lhsOrder = providerOrder[lhs.element.provider, default: .max]
             let rhsOrder = providerOrder[rhs.element.provider, default: .max]

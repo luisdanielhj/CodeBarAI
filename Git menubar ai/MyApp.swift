@@ -99,7 +99,8 @@ private struct ProviderLimitSummary: Identifiable {
     let title: String
     let logoName: String
     let accountNumber: Int?
-    /// The session limit, or Auto for Cursor, or credits for Kiro.
+    /// The session limit, or Auto for Cursor, or credits for Kiro, or the
+    /// first model family for Antigravity.
     let top: Limit
     /// The weekly limit, or API for Cursor. Kiro has a second pool only
     /// during a free trial or bonus, so its row is omitted otherwise.
@@ -120,6 +121,11 @@ private struct ProviderLimitSummary: Identifiable {
             // Cursor reports no session or weekly limits, only per-cycle pools.
             top = ("autoPercentUsed", "Auto")
             bottom = ("apiPercentUsed", "API")
+        case .antigravity:
+            // Each model family has its own quota. Show the first two in the
+            // order Antigravity's model picker lists them.
+            top = (windows.first?.id ?? "", windows.first?.title ?? "Gemini")
+            bottom = windows.count > 1 ? (windows[1].id, windows[1].title) : nil
         case .kiro:
             top = ("credits", "Credits")
             bottom = windows.first { $0.id == "free_trial" || $0.id.hasPrefix("bonus_") }

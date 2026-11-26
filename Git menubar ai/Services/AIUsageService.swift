@@ -5,7 +5,7 @@ import CryptoKit
 import CommonCrypto
 
 nonisolated enum AIUsageProvider: String, CaseIterable, Identifiable, Sendable {
-    case claude, cursor, codex, kiro
+    case claude, cursor, codex, kiro, antigravity
 
     var id: String { rawValue }
 
@@ -15,6 +15,7 @@ nonisolated enum AIUsageProvider: String, CaseIterable, Identifiable, Sendable {
         case .cursor: return "Cursor"
         case .codex: return "Codex"
         case .kiro: return "Kiro CLI"
+        case .antigravity: return "Antigravity"
         }
     }
 
@@ -24,6 +25,7 @@ nonisolated enum AIUsageProvider: String, CaseIterable, Identifiable, Sendable {
         case .cursor: return "CursorLogo"
         case .codex: return "CodexLogo"
         case .kiro: return "KiroLogo"
+        case .antigravity: return "AntigravityLogo"
         }
     }
 
@@ -37,6 +39,8 @@ nonisolated enum AIUsageProvider: String, CaseIterable, Identifiable, Sendable {
             return "Sign in to Codex with ChatGPT. API keys do not provide subscription limits."
         case .kiro:
             return "Sign in with kiro-cli login. API keys do not provide plan credits."
+        case .antigravity:
+            return "Sign in to Antigravity or the agy CLI with your Google account."
         }
     }
 
@@ -80,6 +84,14 @@ nonisolated enum AIUsageProvider: String, CaseIterable, Identifiable, Sendable {
                 home.appendingPathComponent(".local/bin/kiro-cli"),
                 URL(fileURLWithPath: "/Applications/Kiro CLI.app", isDirectory: true)
             ]
+        case .antigravity:
+            executable = "agy"
+            candidates = [
+                home.appendingPathComponent(".gemini/antigravity-cli", isDirectory: true),
+                home.appendingPathComponent(".local/bin/agy"),
+                home.appendingPathComponent("Applications/Antigravity.app", isDirectory: true),
+                URL(fileURLWithPath: "/Applications/Antigravity.app", isDirectory: true)
+            ]
         }
 
         if candidates.contains(where: { files.fileExists(atPath: $0.path) }) {
@@ -102,6 +114,8 @@ nonisolated struct AIUsageWindow: Identifiable, Sendable {
     let detail: String?
     /// Length of the limit window, used to show how much of it has elapsed.
     var duration: TimeInterval? = nil
+    /// Shown as a full card even when the ID is not a standard limit.
+    var isProminent = false
 }
 
 nonisolated struct AIUsageSnapshot: Sendable {
@@ -247,6 +261,10 @@ actor AIUsageService: AIUsageLoading {
     /// AES key derived from Cursor's "Cursor Safe Storage" Keychain password.
     /// Held in memory only, so the Keychain is read at most once per launch.
     private var cursorStorageKey: Data?
+    /// Antigravity access token renewed by this app, held in memory only.
+    private var antigravityCache: (token: String, expiresAt: Date)?
+    /// Antigravity's OAuth client secret, read from its installed binary.
+    private var antigravityClientSecret: String?
 
     func load(_ provider: AIUsageProvider, claudeProfile: ClaudeAccountProfile? = nil) async throws -> AIUsageSnapshot {
         try await load(provider, claudeProfile: claudeProfile, kiroProfile: nil)
@@ -270,6 +288,15 @@ actor AIUsageService: AIUsageLoading {
            let request = try? codexRequest("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"),
            let details = try? await send(request, provider: .codex, claudeProfile: profile) {
             snapshot.resets = Self.parseCodexResets(details)
+        }
+        // The plan name comes from a second call. Usage still shows without it.
+        if provider == .antigravity,
+           let request = try? await antigravityRequest("loadCodeAssist", body: [
+               "metadata": ["ideType": "ANTIGRAVITY", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"]
+           ]),
+           let data = try? await send(request, provider: .antigravity, claudeProfile: profile),
+           let plan = Self.parseAntigravityPlan(data) {
+            snapshot = AIUsageSnapshot(plan: plan, windows: snapshot.windows, fetchedAt: snapshot.fetchedAt, resets: snapshot.resets)
         }
         return snapshot
     }
@@ -313,7 +340,7 @@ actor AIUsageService: AIUsageLoading {
             ])
             let data = try await send(request, provider: .codex, claudeProfile: profile)
             return try Self.parseCodexResetResult(data)
-        case .cursor, .kiro:
+        case .cursor, .kiro, .antigravity:
             throw AIUsageError.serviceUnavailable
         }
     }
@@ -334,6 +361,29 @@ actor AIUsageService: AIUsageLoading {
     }
 
     private func send(_ request: URLRequest, provider: AIUsageProvider, claudeProfile profile: ClaudeAccountProfile) async throws -> Data {
+        let (data, response) = try await perform(request)
+        switch response.statusCode {
+        case 200..<300:
+            return data
+        case 300..<400:
+            throw AIUsageError.redirectRejected
+        case 401, 403:
+            if provider == .claude {
+                claudeCache.removeValue(forKey: cacheKey(for: profile))
+                claudeOrganizations.removeValue(forKey: cacheKey(for: profile))
+            }
+            if provider == .antigravity { antigravityCache = nil }
+            throw AIUsageError.signInRequired(provider)
+        case 429:
+            throw AIUsageError.rateLimited(Self.retryDate(response, now: Date()))
+        default:
+            throw AIUsageError.serviceUnavailable
+        }
+    }
+
+    /// Sends a request on an ephemeral session that refuses redirects, and
+    /// maps transport failures. Callers interpret the status code.
+    private func perform(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         do {
             try Task.checkCancellation()
             let configuration = URLSessionConfiguration.ephemeral
@@ -356,22 +406,7 @@ actor AIUsageService: AIUsageLoading {
             guard let response = response as? HTTPURLResponse else {
                 throw AIUsageError.invalidResponse
             }
-            switch response.statusCode {
-            case 200..<300:
-                return data
-            case 300..<400:
-                throw AIUsageError.redirectRejected
-            case 401, 403:
-                if provider == .claude {
-                    claudeCache.removeValue(forKey: cacheKey(for: profile))
-                    claudeOrganizations.removeValue(forKey: cacheKey(for: profile))
-                }
-                throw AIUsageError.signInRequired(provider)
-            case 429:
-                throw AIUsageError.rateLimited(Self.retryDate(response, now: Date()))
-            default:
-                throw AIUsageError.serviceUnavailable
-            }
+            return (data, response)
         } catch let error as AIUsageError {
             throw error
         } catch is CancellationError {
@@ -433,6 +468,8 @@ actor AIUsageService: AIUsageLoading {
             return parseCursor(root, now: now)
         case .kiro:
             return parseKiro(root, now: now)
+        case .antigravity:
+            return parseAntigravity(root, now: now)
         }
     }
 
@@ -465,6 +502,8 @@ actor AIUsageService: AIUsageLoading {
             var request = try Self.usageRequest(endpoint)
             request.setValue("Bearer \(credentials.token)", forHTTPHeaderField: "Authorization")
             return request
+        case .antigravity:
+            return try await antigravityRequest("fetchAvailableModels", body: [:])
         }
     }
 
@@ -568,19 +607,29 @@ actor AIUsageService: AIUsageLoading {
     /// prompt, whereas `SecItemCopyMatching` from this app would prompt again
     /// after every refresh or rebuild.
     nonisolated private static func claudeKeychainItem(service: String) async throws -> Data? {
+        try await securityPassword(service: service, account: nil, provider: .claude)
+    }
+
+    /// Reads a Keychain password through `/usr/bin/security`. Never prompts
+    /// when the item trusts that tool, as items written by it do.
+    nonisolated private static func securityPassword(
+        service: String,
+        account: String?,
+        provider: AIUsageProvider
+    ) async throws -> Data? {
         let output: ProcessOutput
         do {
             output = try await ProcessRunner.run(
                 executableURL: URL(fileURLWithPath: "/usr/bin/security"),
-                arguments: ["find-generic-password", "-s", service, "-w"],
+                arguments: ["find-generic-password", "-s", service] + (account.map { ["-a", $0] } ?? []) + ["-w"],
                 timeout: 10
             )
         } catch {
-            throw AIUsageError.credentialAccessDenied(.claude)
+            throw AIUsageError.credentialAccessDenied(provider)
         }
         // 44 is errSecItemNotFound's exit status.
         if output.exitCode == 44 { return nil }
-        guard output.isSuccess else { throw AIUsageError.credentialAccessDenied(.claude) }
+        guard output.isSuccess else { throw AIUsageError.credentialAccessDenied(provider) }
         return Data(output.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines).utf8)
     }
 
@@ -953,6 +1002,279 @@ actor AIUsageService: AIUsageLoading {
         if let date = isoDate(text) { return date }
         let trimmed = text.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
         return isoDate(trimmed)
+    }
+
+    // MARK: Antigravity
+
+    nonisolated struct AntigravityCredentials: Sendable {
+        let accessToken: String?
+        let expiresAt: Date?
+        let refreshToken: String?
+        /// The OAuth client the sign-in belongs to, from its ID token.
+        let clientID: String?
+    }
+
+    /// Antigravity's desktop OAuth client, used when the saved sign-in has
+    /// no ID token to name it. A client ID is public by design.
+    nonisolated static let antigravityDefaultClientID =
+        "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+
+    nonisolated private static let antigravityHost = "https://cloudcode-pa.googleapis.com/v1internal:"
+
+    private func antigravityRequest(_ method: String, body: [String: Any]) async throws -> URLRequest {
+        var request = try Self.usageRequest(Self.antigravityHost + method)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // The service returns quotas only to a client it recognizes.
+        request.setValue(Self.antigravityUserAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("Bearer \(try await antigravityToken())", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        return request
+    }
+
+    nonisolated static let antigravityUserAgent: String = {
+        let plist = URL(fileURLWithPath: "/Applications/Antigravity.app/Contents/Info.plist")
+        let version = (NSDictionary(contentsOf: plist)?["CFBundleShortVersionString"] as? String)
+            .flatMap { $0.utf8.allSatisfy { (48...57).contains($0) || $0 == 46 } && !$0.isEmpty ? $0 : nil }
+            ?? "2.19.1"
+        #if arch(arm64)
+        return "antigravity/\(version) darwin/arm64"
+        #else
+        return "antigravity/\(version) darwin/amd64"
+        #endif
+    }()
+
+    /// Antigravity and its `agy` CLI keep one Google sign-in in the Keychain,
+    /// written through `/usr/bin/security`, so reading it never prompts.
+    /// Neither saves the access token it renews, so the saved one is usually
+    /// stale. It is renewed here in memory with the saved refresh token, which
+    /// Google does not rotate: the app's own sign-in keeps working. Nothing is
+    /// written back.
+    private func antigravityToken() async throws -> String {
+        if let cached = antigravityCache, cached.expiresAt > Date().addingTimeInterval(60) {
+            return cached.token
+        }
+        guard let data = try await Self.securityPassword(service: "gemini", account: "antigravity", provider: .antigravity) else {
+            throw AIUsageError.signInRequired(.antigravity)
+        }
+        let credentials = try Self.parseAntigravityCredentials(data)
+        if let token = credentials.accessToken {
+            if let expiry = credentials.expiresAt, expiry > Date().addingTimeInterval(60) {
+                antigravityCache = (token, expiry)
+                return token
+            }
+            // No expiry and nothing to renew with: try the token as it is.
+            if credentials.expiresAt == nil, credentials.refreshToken == nil { return token }
+        }
+        guard let refreshToken = credentials.refreshToken else {
+            throw AIUsageError.expiredCredentials(.antigravity)
+        }
+        let renewed = try await renewAntigravityToken(
+            refreshToken: refreshToken,
+            clientID: credentials.clientID ?? Self.antigravityDefaultClientID
+        )
+        antigravityCache = renewed
+        return renewed.token
+    }
+
+    private func renewAntigravityToken(refreshToken: String, clientID: String) async throws -> (token: String, expiresAt: Date) {
+        let secrets = antigravityClientSecret.map { [$0] } ?? Self.antigravityClientSecrets()
+        guard !secrets.isEmpty else { throw AIUsageError.expiredCredentials(.antigravity) }
+        for secret in secrets {
+            var request = try Self.usageRequest("https://oauth2.googleapis.com/token")
+            request.httpMethod = "POST"
+            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data(Self.formEncoded([
+                ("client_id", clientID),
+                ("client_secret", secret),
+                ("refresh_token", refreshToken),
+                ("grant_type", "refresh_token")
+            ]).utf8)
+            let (data, response) = try await perform(request)
+            let error = Self.jsonObject(data)?["error"] as? String
+            // This secret belongs to another client in the same binary.
+            if error == "invalid_client" || error == "unauthorized_client" { continue }
+            switch response.statusCode {
+            case 200..<300:
+                guard let root = Self.jsonObject(data),
+                      let token = root["access_token"] as? String, Self.safeToken(token) else {
+                    throw AIUsageError.invalidResponse
+                }
+                let lifetime = Self.nonnegative(root["expires_in"]).map { min($0, 86_400) } ?? 3_000
+                antigravityClientSecret = secret
+                return (token, Date().addingTimeInterval(lifetime))
+            case 400 where error == "invalid_grant":
+                throw AIUsageError.expiredCredentials(.antigravity)
+            case 429:
+                throw AIUsageError.rateLimited(Self.retryDate(response, now: Date()))
+            default:
+                throw AIUsageError.serviceUnavailable
+            }
+        }
+        // An update may have changed the client. Look the secret up again next time.
+        antigravityClientSecret = nil
+        throw AIUsageError.expiredCredentials(.antigravity)
+    }
+
+    /// Antigravity ships its OAuth client secret inside its own binaries, as
+    /// desktop apps must. Reading it from the installed copy keeps it current
+    /// and out of this app's source. Returns every candidate found, at most 8.
+    nonisolated static func antigravityClientSecrets(
+        binaries: [URL] = {
+            let home = FileManager.default.homeDirectoryForCurrentUser
+            return [
+                URL(fileURLWithPath: "/Applications/Antigravity.app/Contents/Resources/bin/language_server"),
+                home.appendingPathComponent("Applications/Antigravity.app/Contents/Resources/bin/language_server"),
+                home.appendingPathComponent(".local/bin/agy")
+            ]
+        }()
+    ) -> [String] {
+        let prefix = Array("GOCSPX-".utf8)
+        let length = 28
+        for url in binaries {
+            guard let data = try? Data(contentsOf: url, options: .alwaysMapped) else { continue }
+            var found: [String] = []
+            data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
+                guard let base = buffer.baseAddress else { return }
+                var offset = 0
+                while offset < buffer.count, found.count < 8,
+                      let hit = memmem(base + offset, buffer.count - offset, prefix, prefix.count) {
+                    let start = base.distance(to: hit)
+                    let end = start + prefix.count + length
+                    offset = start + prefix.count
+                    guard end <= buffer.count else { break }
+                    let body = buffer[(start + prefix.count)..<end]
+                    let isSecret = body.allSatisfy {
+                        (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || $0 == 45 || $0 == 95
+                    }
+                    // Go packs strings back to back, so the next byte may
+                    // start another string. A wrong candidate is refused by
+                    // Google as invalid_client and the next one is tried.
+                    if isSecret {
+                        let secret = String(decoding: buffer[start..<end], as: UTF8.self)
+                        if !found.contains(secret) { found.append(secret) }
+                    }
+                }
+            }
+            if !found.isEmpty { return found }
+        }
+        return []
+    }
+
+    /// Reads the saved sign-in: JSON, stored as is or behind go-keyring's
+    /// `go-keyring-base64:` or `go-keyring-encoded:` (hex) prefix.
+    nonisolated static func parseAntigravityCredentials(_ data: Data) throws -> AntigravityCredentials {
+        guard data.count <= 65_536 else { throw AIUsageError.signInRequired(.antigravity) }
+        let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        let json: Data?
+        if text.hasPrefix("go-keyring-base64:") {
+            json = Data(base64Encoded: String(text.dropFirst("go-keyring-base64:".count)))
+        } else if text.hasPrefix("go-keyring-encoded:") {
+            json = hexData(String(text.dropFirst("go-keyring-encoded:".count)))
+        } else {
+            json = Data(text.utf8)
+        }
+        guard let json, let root = jsonObject(json) else { throw AIUsageError.signInRequired(.antigravity) }
+        let token = root["token"] as? [String: Any] ?? root
+        let access = (token["access_token"] as? String).flatMap { safeToken($0) ? $0 : nil }
+        let refresh = (token["refresh_token"] as? String).flatMap { safeToken($0) ? $0 : nil }
+        guard access != nil || refresh != nil else { throw AIUsageError.signInRequired(.antigravity) }
+        // Go writes a zero time, year 1, for a token with no expiry.
+        let expiry = flexibleDate(token["expiry"]).flatMap { $0.timeIntervalSince1970 > 0 ? $0 : nil }
+        let audience = (root["id_token"] as? String).flatMap(jwtPayload).flatMap { payload -> String? in
+            (payload["aud"] as? String) ?? (payload["aud"] as? [Any])?.first as? String
+        }
+        let clientID = audience.flatMap {
+            safeIdentifier($0) && $0.hasSuffix(".apps.googleusercontent.com") ? $0 : nil
+        }
+        return AntigravityCredentials(accessToken: access, expiresAt: expiry, refreshToken: refresh, clientID: clientID)
+    }
+
+    nonisolated private static func hexData(_ text: String) -> Data? {
+        let bytes = Array(text.utf8)
+        guard bytes.count % 2 == 0 else { return nil }
+        var data = Data(capacity: bytes.count / 2)
+        for index in stride(from: 0, to: bytes.count, by: 2) {
+            guard let byte = UInt8(String(decoding: bytes[index...index + 1], as: UTF8.self), radix: 16) else { return nil }
+            data.append(byte)
+        }
+        return data
+    }
+
+    nonisolated private static func formEncoded(_ fields: [(String, String)]) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return fields.map { key, value in
+            "\(key)=\(value.addingPercentEncoding(withAllowedCharacters: allowed) ?? "")"
+        }.joined(separator: "&")
+    }
+
+    nonisolated static func parseAntigravityPlan(_ data: Data) -> String? {
+        guard let root = jsonObject(data) else { return nil }
+        let paid = root["paidTier"] as? [String: Any]
+        let current = root["currentTier"] as? [String: Any]
+        return displayText(paid?["name"]) ?? displayText(current?["name"])
+    }
+
+    /// Antigravity limits each model family separately: the thinking levels
+    /// of one model, such as Claude Opus Low and High, draw on one quota.
+    /// Each family becomes one window, in the order the model picker shows.
+    nonisolated static func parseAntigravity(_ root: [String: Any], now: Date) -> AIUsageSnapshot {
+        let models = root["models"] as? [String: Any] ?? [:]
+        let families = root["groupedModels"] as? [String: Any] ?? [:]
+        let picker = ((root["agentModelSorts"] as? [Any])?.first as? [String: Any])?["groups"] as? [Any] ?? []
+        var order = picker.compactMap { $0 as? [String: Any] }
+            .flatMap { ($0["modelIds"] as? [Any] ?? []).compactMap { $0 as? String } }
+        if order.isEmpty {
+            order = models.keys.sorted {
+                let lhs = (models[$0] as? [String: Any])?["displayName"] as? String ?? $0
+                let rhs = (models[$1] as? [String: Any])?["displayName"] as? String ?? $1
+                return lhs.localizedStandardCompare(rhs) == .orderedAscending
+            }
+        }
+        let levels = #"-(minimal|low|medium|high|xhigh|max)$"#
+        let levelNames = #" \((Minimal|Low|Medium|High|Extra High|Max)\)$"#
+
+        var windows: [AIUsageWindow] = []
+        var indexByFamily: [String: Int] = [:]
+        for id in order.prefix(100) {
+            guard let model = models[id] as? [String: Any],
+                  boolean(model["isInternal"]) != true,
+                  let name = displayText(model["displayName"]),
+                  let quota = model["quotaInfo"] as? [String: Any] else { continue }
+            let resetsAt = isoDate(quota["resetTime"])
+            // An exhausted quota omits its zero fraction but keeps its reset.
+            guard let remaining = nonnegative(quota["remainingFraction"]) ?? (resetsAt == nil ? nil : 0) else { continue }
+            let used = (1 - min(remaining, 1)) * 100
+
+            let family = families.keys.filter { id == $0 || id.hasPrefix($0 + "-") }.max { $0.count < $1.count }
+                ?? id.replacingOccurrences(of: levels, with: "", options: .regularExpression)
+            let title = displayText((families[family] as? [String: Any])?["displayName"])
+                ?? name.replacingOccurrences(of: levelNames, with: "", options: .regularExpression)
+
+            if let index = indexByFamily[family] {
+                // Show the variant closest to its limit.
+                if used > windows[index].usedPercent ?? 0 {
+                    windows[index] = AIUsageWindow(id: windows[index].id, title: windows[index].title, usedPercent: used,
+                                                   resetsAt: resetsAt, detail: nil, isProminent: windows[index].isProminent)
+                }
+                continue
+            }
+            guard windows.count < 12 else { continue }
+            let key = String(family.unicodeScalars.map {
+                CharacterSet.alphanumerics.contains($0) && $0.isASCII ? Character($0) : "_"
+            })
+            indexByFamily[family] = windows.count
+            windows.append(AIUsageWindow(
+                id: "model_\(key)",
+                title: title,
+                usedPercent: used,
+                resetsAt: resetsAt,
+                detail: nil,
+                isProminent: windows.count < 2
+            ))
+        }
+        return AIUsageSnapshot(plan: nil, windows: windows, fetchedAt: now)
     }
 
     nonisolated private static func validateClaude(_ data: Data) throws -> (token: String, expiresAt: Date?) {

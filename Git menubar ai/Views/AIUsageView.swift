@@ -18,7 +18,7 @@ struct LimitsView: View {
                         EmptyState(
                             systemImage: "gauge.with.dots.needle.33percent",
                             title: "No providers connected",
-                            message: "Connect Claude Code, Codex, Cursor or Kiro CLI below to track your plan limits."
+                            message: "Connect Claude Code, Codex, Cursor, Kiro CLI or Antigravity below to track your plan limits."
                         )
                     }
                     ForEach(connected) { state in
@@ -226,7 +226,9 @@ private struct ProviderLimitsSection: View {
                 .lineLimit(1)
                 .help(state.claudeProfile?.configDirectory.path ?? state.kiroProfile?.database.path ?? state.provider.title)
             if let plan = state.snapshot?.plan {
-                Text(plan.capitalized)
+                // Lowercase plan IDs such as "plus" get capitals; names such
+                // as "Google AI Pro" are already written for display.
+                Text(plan == plan.lowercased() ? plan.capitalized : plan)
                     .font(.system(size: 10.5))
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
@@ -308,7 +310,7 @@ private struct ProviderLimitsSection: View {
 private extension AIUsageWindow {
     /// The windows that get a full card. Everything else is a compact row.
     var isPrimary: Bool {
-        ["five_hour", "seven_day", "primary_window", "secondary_window", "plan", "credits"].contains(id)
+        isProminent || ["five_hour", "seven_day", "primary_window", "secondary_window", "plan", "credits"].contains(id)
     }
 
     var displayTitle: String {
